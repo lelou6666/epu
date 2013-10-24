@@ -41,6 +41,7 @@ sleeper_dt = {
         'site1': {
             'iaas_image': 'ami-fake',
             'iaas_allocation': 't1.micro',
+            'needs_elastic_ip': True,
         }
     }
 }
@@ -69,7 +70,7 @@ class TestProvisionerIntegration(unittest.TestCase, TestFixture):
         self.provisioner_client = clients['prov_0']
 
         self.fake_site_name = "site1"
-        self.fake_site, self.driver = self.make_fake_libcloud_site(self.fake_site_name)
+        self.fake_site, self.driver = self.make_fake_libcloud_site(self.fake_site_name, needs_elastic_ip=True)
 
         self.block_until_ready(deployment, self.dashi)
 
@@ -80,7 +81,7 @@ class TestProvisionerIntegration(unittest.TestCase, TestFixture):
         self.dtrs_client.add_site(self.fake_site_name, self.fake_site)
         self.dtrs_client.add_credentials(self.user, self.fake_site_name, fake_credentials)
 
-    def test_example(self):
+    def test_elastic_ip(self):
 
         launch_id = "test"
         instance_ids = ["test"]
@@ -99,9 +100,14 @@ class TestProvisionerIntegration(unittest.TestCase, TestFixture):
             else:
                 assert False, "Got unexpected state %s" % instances[0]['state']
 
+        instance = instances[0]
+        assert instance.get('elastic_ip')
+
         # check that mock has a VM
         mock_vms = self.driver.list_nodes()
         assert len(mock_vms) == 1
+
+        self.provisioner_client.terminate_nodes([instances[0]['node_id']])
 
     def test_zombie_node(self):
 

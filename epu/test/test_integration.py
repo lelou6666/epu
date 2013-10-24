@@ -74,7 +74,7 @@ example_dt = {
             'iaas_allocation': 'm1.large',
         },
         'ec2-fake': {
-            'iaas_image': 'ami-fake',
+            'iaas_image': 'xxami-fake',
             'iaas_allocation': 't1.micro',
         }
     },
@@ -636,7 +636,7 @@ dt_registries:
 """
 
 
-class TestProvisionerIntegration(unittest.TestCase, TestFixture):
+class TestProvisionerIntegrationLowTimeout(unittest.TestCase, TestFixture):
 
     def setUp(self):
 
@@ -666,7 +666,8 @@ class TestProvisionerIntegration(unittest.TestCase, TestFixture):
             print "Using fake site"
             # Set up fake libcloud and start deployment
             self.site_name = "ec2-fake"
-            self.site, self.libcloud = self.make_fake_libcloud_site(self.site_name)
+            self.site, self.libcloud = self.make_fake_libcloud_site(self.site_name, needs_elastic_ip=True)
+            print "FAKE"
             self.credentials = fake_credentials
 
         self.setup_harness(exchange=self.exchange, sysname=self.sysname)
