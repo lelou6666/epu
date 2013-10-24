@@ -79,29 +79,6 @@ class TestProvisionerIntegration(unittest.TestCase, TestFixture):
         self.dtrs_client.add_site(self.fake_site_name, self.fake_site)
         self.dtrs_client.add_credentials(self.user, self.fake_site_name, fake_credentials)
 
-    def test_example(self):
-
-        launch_id = "test"
-        instance_ids = ["test"]
-        deployable_type = "sleeper"
-        site = self.fake_site_name
-
-        self.provisioner_client.provision(launch_id, instance_ids, deployable_type, site=site)
-
-        while True:
-            instances = self.provisioner_client.describe_nodes()
-            if instances[0]['state'] in ('200-REQUESTED', '400-PENDING'):
-                time.sleep(0.1)
-                continue
-            elif instances[0]['state'] == '600-RUNNING':
-                break
-            else:
-                assert False, "Got unexpected state %s" % instances[0]['state']
-
-        # check that mock has a VM
-        mock_vms = self.driver.list_nodes()
-        assert len(mock_vms) == 1
-
     def test_elastic_ip(self):
 
         launch_id = "test"
@@ -122,12 +99,13 @@ class TestProvisionerIntegration(unittest.TestCase, TestFixture):
                 assert False, "Got unexpected state %s" % instances[0]['state']
 
         instance = instances[0]
-        print instance
         assert instance.get('elastic_ip')
 
         # check that mock has a VM
         mock_vms = self.driver.list_nodes()
         assert len(mock_vms) == 1
+
+        self.provisioner_client.terminate_nodes([instances[0]['node_id']])
 
     def test_zombie_node(self):
 
