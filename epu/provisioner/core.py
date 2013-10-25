@@ -700,6 +700,9 @@ class ProvisionerCore(object):
         except timeout:
             log.exception("Timeout when querying site '%s'", site)
             raise
+        except Exception:
+            log.exception("Failed to list nodes on site '%s'", site)
+            raise
 
         libcloud_nodes = dict((node.id, node) for node in libcloud_nodes)
 
