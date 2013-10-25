@@ -1,6 +1,6 @@
 amqp==1.0.10
 anyjson==0.3.3
--e git+https://github.com/apache/libcloud.git@trunk#egg=apache_libcloud-dev
+https://github.com/apache/libcloud/archive/455f11c9d40ead11d3e4ad7a2f38f4f90b78c866.tar.gz
 boto==2.8.0
 dashi==0.3.0
 gevent==0.13.8
