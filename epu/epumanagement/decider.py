@@ -245,7 +245,7 @@ class EPUMDecider(object):
         domain_id = domain.domain_id
         user = domain.owner
         sensor_type = config.get(CONF_SENSOR_TYPE)
-        period = 60
+        period = 120
         monitor_sensors = config.get('monitor_sensors', [])
         monitor_domain_sensors = config.get('monitor_domain_sensors', [])
         sample_period = config.get('sample_period', DEFAULT_SENSOR_SAMPLE_PERIOD)
@@ -308,6 +308,7 @@ class EPUMDecider(object):
 
                 start_time = None
                 end_time = None
+                phantom_unique = None
                 dimensions = {}
                 if sensor_type in (CLOUDWATCH_SENSOR_TYPE, MOCK_CLOUDWATCH_SENSOR_TYPE):
                     end_time = datetime.utcnow()
@@ -352,7 +353,7 @@ class EPUMDecider(object):
                 except Exception:
                     log.exception("Problem getting sensor state")
                 for index, metric_result in state.iteritems():
-                    if index not in (instance.iaas_id, instance.hostname):
+                    if index not in (instance.iaas_id, instance.hostname, phantom_unique):
                         continue
                     series = metric_result.get(Statistics.SERIES)
                     if series is not None and series != []:
