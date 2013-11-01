@@ -543,11 +543,13 @@ class ProvisionerCore(object):
                 n.ctx_name = spec.name
                 if elastic_ip is not None:
                     n.elastic_ip = elastic_ip
+                    n.public_ip = elastic_ip
         else:
 
             node.ctx_name = spec.name
             if elastic_ip is not None:
                 node.elastic_ip = elastic_ip
+                node.public_ip = elastic_ip
 
         return node
 
@@ -1291,10 +1293,11 @@ def update_node_ip_info(node_rec, iaas_node):
     updated = False
 
     public_ip = node_rec.get('public_ip')
+    elastic_ip = node_rec.get('elastic_ip')
     iaas_public_ip = iaas_node.public_ip
     if isinstance(iaas_public_ip, (list, tuple)):
         iaas_public_ip = iaas_public_ip[0] if iaas_public_ip else None
-    if not public_ip or (iaas_public_ip and public_ip != iaas_public_ip):
+    if not elastic_ip and (not public_ip or (iaas_public_ip and public_ip != iaas_public_ip)):
         node_rec['public_ip'] = iaas_public_ip
         updated = True
 
@@ -1316,6 +1319,7 @@ def update_node_ip_info(node_rec, iaas_node):
 
     try:
         node_rec['elastic_ip'] = iaas_node.elastic_ip
+        node_rec['public_ip'] = iaas_node.elastic_ip
         updated = True
     except AttributeError:
         pass
