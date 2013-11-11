@@ -11,6 +11,7 @@ from epu.processdispatcher.store import ProcessRecord, NodeRecord, \
 from epu.processdispatcher.modes import RestartMode
 from epu.processdispatcher.util import get_process_state_message, \
     get_set_difference_debug_message
+from epu.processdispatcher.engines import EngineSpec
 
 log = logging.getLogger(__name__)
 
@@ -1012,6 +1013,22 @@ class ProcessDispatcherCore(object):
             nodes[node_id] = dict(node)
 
         return state
+
+    def add_engine(self, definition):
+        try:
+            engine_id = definition['engine_id']
+            del(definition['engine_id'])
+        except KeyError:
+            raise BadRequestError("Definition must have an 'engine_id'")
+
+        try:
+            slots = definition['slots']
+            del(definition['slots'])
+        except KeyError:
+            raise BadRequestError("Definition must have 'slots'")
+
+        engine = EngineSpec(engine_id, slots, **definition)
+        self.ee_registry.add(engine)
 
 
 def _check_process_schedule_idempotency(process, parameters):
