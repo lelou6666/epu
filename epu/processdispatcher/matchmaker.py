@@ -115,6 +115,10 @@ class PDMatchmaker(object):
         self.registered_needs = {}
         self._get_pending_processes()
 
+        self._create_missing_domains()
+
+    def _create_missing_domains(self):
+
         # create the domains if they don't already exist
         if self.epum_client:
             for engine in list(self.ee_registry):
@@ -174,6 +178,9 @@ class PDMatchmaker(object):
         engine_conf = config['engine_conf']
         if engine_conf is None:
             config['engine_conf'] = engine_conf = {}
+
+        if engine.deployable_type:
+            engine_conf['deployable_type'] = engine.deployable_type
 
         if engine.iaas_allocation:
             engine_conf['iaas_allocation'] = engine.iaas_allocation
@@ -360,6 +367,8 @@ class PDMatchmaker(object):
                         self.condition.wait(timeout)
 
     def matchmake(self):
+        self._create_missing_domains()
+
         node_containers = self.get_available_resources()
         log.debug("Matchmaking. Processes: %d  Available nodes: %d",
                   len(self.queued_processes), len(node_containers))

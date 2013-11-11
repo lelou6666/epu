@@ -113,6 +113,7 @@ class ProcessDispatcherService(object):
         self.dashi.handle(self.node_state)
         self.dashi.handle(self.heartbeat, sender_kwarg='sender')
         self.dashi.handle(self.dump)
+        self.dashi.handle(self.add_engine)
 
         self.matchmaker.start_election()
 
@@ -198,6 +199,9 @@ class ProcessDispatcherService(object):
 
     def dump(self):
         return self.core.dump()
+
+    def add_engine(self, definition):
+        self.core.add_engine(definition)
 
 
 class SubscriberNotifier(object):
