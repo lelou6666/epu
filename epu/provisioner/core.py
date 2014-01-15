@@ -1318,9 +1318,10 @@ def update_node_ip_info(node_rec, iaas_node):
         updated = True
 
     try:
-        node_rec['elastic_ip'] = iaas_node.elastic_ip
-        node_rec['public_ip'] = iaas_node.elastic_ip
-        updated = True
+        if iaas_node.elastic_ip is not None:
+            node_rec['elastic_ip'] = iaas_node.elastic_ip
+            node_rec['public_ip'] = iaas_node.elastic_ip
+            updated = True
     except AttributeError:
         pass
 

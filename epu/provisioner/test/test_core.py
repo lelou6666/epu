@@ -976,18 +976,18 @@ class ProvisionerCoreTests(unittest.TestCase):
 
     def test_update_node_ip_info(self):
         node = dict(public_ip=None)
-        iaas_node = Mock(public_ip=None, private_ip=None, extra={'dns_name': None})
+        iaas_node = Mock(elastic_ip=None, public_ip=None, private_ip=None, extra={'dns_name': None})
         update_node_ip_info(node, iaas_node)
         self.assertEqual(node['public_ip'], None)
         self.assertEqual(node['private_ip'], None)
 
-        iaas_node = Mock(public_ip=["pub1"], private_ip=["priv1"], extra={'dns_name': 'host'})
+        iaas_node = Mock(elastic_ip=None, public_ip=["pub1"], private_ip=["priv1"], extra={'dns_name': 'host'})
         update_node_ip_info(node, iaas_node)
         self.assertEqual(node['public_ip'], "pub1")
         self.assertEqual(node['private_ip'], "priv1")
         self.assertEqual(node['hostname'], "host")
 
-        iaas_node = Mock(public_ip=[], private_ip=[], extra={'dns_name': []})
+        iaas_node = Mock(elastic_ip=None, public_ip=[], private_ip=[], extra={'dns_name': []})
         update_node_ip_info(node, iaas_node)
         self.assertEqual(node['public_ip'], "pub1")
         self.assertEqual(node['private_ip'], "priv1")
