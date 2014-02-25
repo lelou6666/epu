@@ -71,7 +71,6 @@ setup(
         'Topic :: Scientific/Engineering'
     ),
     packages=find_packages(),
-    dependency_links=['http://sddevrepo.oceanobservatories.org/releases'],
     install_requires=requires,
     tests_require=tests_require,
     extras_require=extras_require,
