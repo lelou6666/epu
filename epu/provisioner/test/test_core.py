@@ -39,8 +39,20 @@ class ProvisionerCoreTests(unittest.TestCase):
         self.ctx = FakeContextClient()
         self.dtrs = FakeDTRS()
 
-        self.dtrs.sites["site1"] = self.dtrs.sites["site2"] = {
-            "type": "fake"
+        self.dtrs.sites = {
+            "asterix": {
+                "site1": {
+                    "type": "fake"
+                }
+            },
+            None: {
+                "site1": {
+                    "type": "fake"
+                },
+                "site2": {
+                    "type": "fake"
+                }
+            }
         }
 
         self.dtrs.credentials['site'][("asterix", "site1")] = self.dtrs.credentials['site'][("asterix", "site2")] = {

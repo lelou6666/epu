@@ -398,7 +398,7 @@ class ProvisionerCore(object):
             raise ProvisioningError("Called with bad caller %s" % caller)
 
         # Get the site description from DTRS
-        site_description = self.dtrs.describe_site(site_name)
+        site_description = self.dtrs.describe_site(site_name, caller=caller)
         if not site_description:
             raise ProvisioningError("Site description not found for %s" % site_name)
 
@@ -676,7 +676,7 @@ class ProvisionerCore(object):
             raise ProvisioningError("Called with bad caller %s" % caller)
 
         # Get the site description from DTRS
-        site_description = self.dtrs.describe_site(site)
+        site_description = self.dtrs.describe_site(site, caller=caller)
         if not site_description:
             raise ProvisioningError("Site description not found for %s" % site)
 
@@ -1140,7 +1140,7 @@ class ProvisionerCore(object):
                 raise ProvisioningError(msg)
 
             # Get the site description from DTRS
-            site_description = self.dtrs.describe_site(site_name)
+            site_description = self.dtrs.describe_site(site_name, caller=caller)
             if not site_description:
                 msg = "Site description not found for %s" % site_name
                 log.error(msg)
