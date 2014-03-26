@@ -1,6 +1,6 @@
 amqp==1.0.10
 anyjson==0.3.3
-https://github.com/nimbusproject/libcloud/archive/phantom.zip
+-e git+https://github.com/nimbusproject/libcloud.git@phantom#egg=apache-libcloud
 boto==2.8.0
 dashi==0.3.0
 gevent==0.13.8
