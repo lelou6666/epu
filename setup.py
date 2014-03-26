@@ -14,7 +14,7 @@ version = '2.1.1'
 requires = [
     'httplib2>=0.7.1',
     'boto >= 2.6',
-    'apache-libcloud >= 0.11.1, < 0.14.0',
+    'apache-libcloud==0.14.0-beta2',
     'kazoo==1.2.1',
     'dashi>=0.2.1',
     'gevent>=0.13.7',
