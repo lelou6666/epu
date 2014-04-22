@@ -1,10 +1,12 @@
 # Copyright 2013 University of Chicago
 
-
-import urllib
 import httplib
+import logging
+import urllib
 
 from epu.sensors import ISensorAggregator, Statistics
+
+log = logging.getLogger(__name__)
 
 _stat_map = {
     Statistics.AVERAGE: 'avg',
@@ -62,10 +64,15 @@ class OpenTSDB(ISensorAggregator):
             'ascii': 'true'
         })
         opentsdb = self.get_opentsdb_connection()
-        opentsdb.request('GET', '/q?%s' % params)
+        try:
+            opentsdb.request('GET', '/q?%s' % params)
+        except:
+            log.exception("Failed to query OpenTSDB")
+            return {}
         response = opentsdb.getresponse()
 
         if response.status != 200:
+            log.warn("OpenTSDB query returned status %d", response.status)
             return {}
 
         # TODO: this could be process etc in future
