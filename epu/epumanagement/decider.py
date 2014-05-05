@@ -320,6 +320,10 @@ class EPUMDecider(object):
                     start_time = end_time - timedelta(seconds=sample_period)
 
                     site = self.dtrs_client.describe_site(instance.site)
+                    if site is None:
+                        log.warning("Can't find site '%s' for instance '%s'. skipping for now", instance.site,
+                                instance.instance_id)
+                        continue
                     opentsdb_tag = site.get("opentsdb_tag", "host")
                     log.info("PDA: tag: %s" % opentsdb_tag)
                     if opentsdb_tag == 'host':
