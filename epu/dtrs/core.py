@@ -149,9 +149,17 @@ class DTRSCore(object):
             elif ctx_method == 'userdata':
                 needs_nimbus_ctx = False
                 try:
-                    userdata = str(contextualization['userdata'])
+                    userdata = contextualization['userdata']
                 except KeyError:
                     raise DeployableTypeValidationError(dt_name, 'Missing userdata in DT definition')
+                if isinstance(userdata, dict):
+                    try:
+                        userdata = str(userdata[site])
+                    except KeyError:
+                        raise DeployableTypeValidationError(dt_name, 'Missing site %s for multi-site userdata in DT definition' % site)
+                else:
+                    userdata = str(userdata)
+
                 document = generate_cluster_document(iaas_image)
                 response_node['iaas_userdata'] = userdata
             else:
