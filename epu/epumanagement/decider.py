@@ -1,19 +1,38 @@
-import logging
+# Copyright 2013 University of Chicago
+
 from copy import deepcopy
+from datetime import datetime, timedelta
+import logging
+import time
 import uuid
 
 from dashi.util import LoopingCall
 
+try:
+    from statsd import StatsClient
+except ImportError:
+    StatsClient = None
+
 from epu import cei_events
-from epu.epumanagement.conf import *
+from epu.epumanagement.conf import *  # noqa
 from epu.epumanagement.forengine import Control
 from epu.decisionengine import EngineLoader
 from epu.states import InstanceState
+from epu.sensors import MOCK_CLOUDWATCH_SENSOR_TYPE, OPENTSDB_SENSOR_TYPE,\
+    CLOUDWATCH_SENSOR_TYPE, Statistics
+from epu.sensors.cloudwatch import CloudWatch
+from epu.sensors.opentsdb import OpenTSDB
+from epu.epumanagement.test.mocks import MockCloudWatch
+from epu.decisionengine.impls.sensor import CONF_SENSOR_TYPE
+
 from epu.domain_log import EpuLoggerThreadSpecific
 
 log = logging.getLogger(__name__)
 
 DEFAULT_ENGINE_CLASS = "epu.decisionengine.impls.simplest.SimplestEngine"
+DEFAULT_SENSOR_SAMPLE_PERIOD = 90
+DEFAULT_SENSOR_SAMPLE_FUNCTION = 'Average'
+
 
 class EPUMDecider(object):
     """The decider handles critical sections related to running decision engine cycles.
@@ -32,14 +51,15 @@ class EPUMDecider(object):
     "I hear the voices [...] and I know the speculation.  But I'm the decider, and I decide what is best."
     """
 
-    def __init__(self, epum_store, subscribers, provisioner_client, epum_client,
-                 disable_loop=False, base_provisioner_vars=None):
+    def __init__(self, epum_store, subscribers, provisioner_client, epum_client, dtrs_client,
+                 disable_loop=False, base_provisioner_vars=None, loop_interval=5.0, statsd_cfg=None):
         """
         @param epum_store State abstraction for all domains
         @type epum_store EPUMStore
         @param subscribers A way to signal state changes
         @param provisioner_client A way to launch/destroy VMs
         @param epum_client A way to launch subtasks to EPUM workers (reactor roles)
+        @param dtrs_client A way to get information from dtrs
         @param disable_loop For unit/integration tests, don't run a timed decision loop
         @param base_provisioner_vars base vars given to every launch
         """
@@ -48,9 +68,11 @@ class EPUMDecider(object):
         self.subscribers = subscribers
         self.provisioner_client = provisioner_client
         self.epum_client = epum_client
+        self.dtrs_client = dtrs_client
 
         self.control_loop = None
         self.enable_loop = not disable_loop
+        self.loop_interval = float(loop_interval)
         self.is_leader = False
 
         # these are given to every launch after engine-provided vars are folded in
@@ -65,6 +87,15 @@ class EPUMDecider(object):
         # The instances of Control (stateful) that are passed to each Engine to get info and execute cmds
         self.controls = {}
 
+        self.statsd_client = None
+        if statsd_cfg is not None:
+            try:
+                host = statsd_cfg["host"]
+                port = statsd_cfg["port"]
+                log.info("Setting up statsd client with host %s and port %d" % (host, port))
+                self.statsd_client = StatsClient(host, port)
+            except:
+                log.exception("Failed to set up statsd client")
 
     def recover(self):
         """Called whenever the whole EPUManagement instance is instantiated.
@@ -109,8 +140,7 @@ class EPUMDecider(object):
                         instance_ids.append(instance.instance_id)
 
         if instance_ids:
-            svc_name = self.epum_store.epum_service_name()
-            self.provisioner_client.dump_state(nodes=instance_ids, force_subscribe=svc_name)
+            self.provisioner_client.dump_state(nodes=instance_ids)
 
         # TODO: We need to make a decision about how an engine can be configured to fire vs. how the
         #       decider fires it's top-loop.  The decider's granularity controls minimums.
@@ -118,7 +148,7 @@ class EPUMDecider(object):
         if self.enable_loop:
             if not self.control_loop:
                 self.control_loop = LoopingCall(self._loop_top)
-            self.control_loop.start(5)
+            self.control_loop.start(self.loop_interval)
 
     def _loop_top(self):
         """Every iteration of the decider loop, the following happens:
@@ -137,12 +167,13 @@ class EPUMDecider(object):
            B. Run decision cycle.
         """
 
+        before = time.time()
         domains = self.epum_store.get_all_domains()
 
         # Perhaps in the meantime, the leader connection failed, bail early
         if not self.is_leader:
             return
-            
+
         # look for domains that are not active anymore
         active_domains = {}
         for domain in domains:
@@ -156,9 +187,15 @@ class EPUMDecider(object):
                         # New engines (new to this decider instance, at least)
                             try:
                                 self._new_engine(domain)
-                            except Exception,e:
+                            except Exception, e:
                                 log.error("Error creating engine '%s' for user '%s': %s",
                                     domain.domain_id, domain.owner, str(e), exc_info=True)
+
+        if self.statsd_client is not None:
+            try:
+                self.statsd_client.gauge("active_domains", len(active_domains))
+            except:
+                log.exception("Failed to submit metrics")
 
         for key in self.engines:
             # Perhaps in the meantime, the leader connection failed, bail early
@@ -175,26 +212,193 @@ class EPUMDecider(object):
                     try:
                         self.engines[key].reconfigure(self.controls[key], engine_conf)
                         self.engine_config_versions[key] = version
-                    except Exception,e:
+                    except Exception, e:
                         log.error("Error in reconfigure call for user '%s' domain '%s': %s",
                               domain.owner, domain.domain_id, str(e), exc_info=True)
 
+                self._get_engine_sensor_state(domain)
                 engine_state = domain.get_engine_state()
+                self._retry_domain_pending_actions(domain, engine_state.instances)
                 try:
                     self.engines[key].decide(self.controls[key], engine_state)
-                except Exception,e:
+
+                except Exception, e:
                     # TODO: if failure, notify creator
                     # TODO: If initialization fails, the engine won't be added to the list and it will be
                     #       attempted over and over.  There could be a retry limit?  Or jut once is enough.
                     log.error("Error in decide call for user '%s' domain '%s': %s",
                         domain.owner, domain.domain_id, str(e), exc_info=True)
 
+        after = time.time()
+        if self.statsd_client is not None:
+            try:
+                self.statsd_client.timing('epum.decider_loop.timing', (after - before) * 1000)
+            except:
+                log.exception("Failed to submit metrics")
+
+    def _get_engine_sensor_state(self, domain):
+        config = domain.get_engine_config()
+        if config is None:
+            log.debug("No engine config for sensor available")
+            return
+
+        domain_id = domain.domain_id
+        user = domain.owner
+        sensor_type = config.get(CONF_SENSOR_TYPE)
+        period = 120
+        monitor_sensors = config.get('monitor_sensors', [])
+        monitor_domain_sensors = config.get('monitor_domain_sensors', [])
+        sample_period = config.get('sample_period', DEFAULT_SENSOR_SAMPLE_PERIOD)
+        sample_function = config.get('sample_function', DEFAULT_SENSOR_SAMPLE_FUNCTION)
+
+        sensor_aggregator = self._get_sensor_aggregator(config)
+        if sensor_aggregator is None:
+            return
+
+        # Support only OpenTSDB sensors for now
+        domain_sensor_state = {}
+        if sensor_type in (OPENTSDB_SENSOR_TYPE, MOCK_CLOUDWATCH_SENSOR_TYPE):
+            for metric in monitor_domain_sensors:
+                start_time = None
+                end_time = None
+                dimensions = {}
+
+                if sensor_type in (MOCK_CLOUDWATCH_SENSOR_TYPE):
+                    # Only for testing. Won't work with real cloudwatch
+                    end_time = datetime.utcnow()
+                    start_time = end_time - timedelta(seconds=sample_period)
+                    dimensions = {'DomainId': domain_id}
+                elif sensor_type == OPENTSDB_SENSOR_TYPE:
+                    # OpenTSDB requires local time
+                    end_time = datetime.now()
+                    start_time = end_time - timedelta(seconds=sample_period)
+                    dimensions = {'domain': domain_id, 'user': user}
+                else:
+                    log.warning("Not sure how to setup '%s' query, skipping" % sensor_type)
+                    continue
+
+                state = {}
+                try:
+                    state = sensor_aggregator.get_metric_statistics(period, start_time,
+                            end_time, metric, sample_function, dimensions)
+                except Exception:
+                    log.exception("Problem getting sensor state")
+                for index, metric_result in state.iteritems():
+                    if index not in (domain_id,):
+                        continue
+                    series = metric_result.get(Statistics.SERIES)
+                    if series is not None and series != []:
+                        domain_sensor_state[metric] = metric_result
+
+        if domain_sensor_state != {}:
+            domain.add_domain_sensor_data(domain_sensor_state)
+
+        instances = domain.get_instances()
+        for instance in instances:
+            sensor_state = {}
+            for metric in monitor_sensors:
+                if 'ec2' not in instance.site and sensor_type == CLOUDWATCH_SENSOR_TYPE:
+                    # Don't support pulling sensor data from cloudwatch in non-ec2 clouds
+                    continue
+
+                if 'ec2' in instance.site and sensor_type == CLOUDWATCH_SENSOR_TYPE:
+                    credentials = self.dtrs_client.describe_credentials(domain.owner, instance.site)
+                    config['access_key'] = credentials.get('access_key')
+                    config['secret_key'] = credentials.get('secret_key')
+
+                start_time = None
+                end_time = None
+                phantom_unique = None
+                dimensions = {}
+                if sensor_type in (CLOUDWATCH_SENSOR_TYPE, MOCK_CLOUDWATCH_SENSOR_TYPE):
+                    end_time = datetime.utcnow()
+                    start_time = end_time - timedelta(seconds=sample_period)
+                    dimensions = {'InstanceId': instance.iaas_id}
+                elif sensor_type == OPENTSDB_SENSOR_TYPE:
+                    # OpenTSDB requires local time
+                    end_time = datetime.now()
+                    start_time = end_time - timedelta(seconds=sample_period)
+
+                    site = self.dtrs_client.describe_site(instance.site)
+                    if site is None:
+                        log.warning("Can't find site '%s' for instance '%s'. skipping for now", instance.site,
+                                instance.instance_id)
+                        continue
+                    opentsdb_tag = site.get("opentsdb_tag", "host")
+                    log.info("PDA: tag: %s" % opentsdb_tag)
+                    if opentsdb_tag == 'host':
+                        if not instance.hostname:
+                            log.warning("Can't find hostname for '%s'. skipping for now" % instance.hostname)
+                            continue
+
+                        dimensions = {'host': instance.hostname}
+                    elif opentsdb_tag == 'phantom_unique':
+
+                        if None in (instance.iaas_image, instance.iaas_id, instance.private_ip):
+                            log.warning("Can't make unique id for '%s'. skipping for now" % instance.iaas_id)
+                            continue
+
+                        phantom_unique = "%s/%s/%s" % (
+                            instance.iaas_image, instance.iaas_id, instance.private_ip)
+
+                        dimensions = {'phantom_unique': phantom_unique}
+                    else:
+                        log.warning("'%s' isn't a recognized opentsdb_tag." % opentsdb_tag)
+                        continue
+                else:
+                    log.warning("Not sure how to setup '%s' query, skipping" % sensor_type)
+                    continue
+                log.info("PDA: dimensions: %s" % dimensions)
+
+                state = {}
+                try:
+                    state = sensor_aggregator.get_metric_statistics(period, start_time,
+                            end_time, metric, sample_function, dimensions)
+                except Exception:
+                    log.exception("Problem getting sensor state")
+                for index, metric_result in state.iteritems():
+                    if index not in (instance.iaas_id, instance.hostname, phantom_unique):
+                        continue
+                    series = metric_result.get(Statistics.SERIES)
+                    if series is not None and series != []:
+                        if not sensor_state.get(instance.instance_id):
+                            sensor_state[instance.instance_id] = {}
+                        sensor_state[instance.instance_id][metric] = metric_result
+
+            if sensor_state != {}:
+                domain.new_instance_sensor(instance.instance_id, sensor_state)
+
+    def _get_sensor_aggregator(self, config):
+        sensor_type = config.get(CONF_SENSOR_TYPE)
+        if sensor_type == CLOUDWATCH_SENSOR_TYPE:
+            if not config.get('access_key') and not config.get('secret_key'):
+                log.debug("No CloudWatch key and secret provided")
+                return
+            sensor_aggregator = CloudWatch(config.get('access_key'),
+                    config.get('secret_key'))
+            return sensor_aggregator
+        elif sensor_type == MOCK_CLOUDWATCH_SENSOR_TYPE:
+            sensor_data = config.get('sensor_data')
+            sensor_aggregator = MockCloudWatch(sensor_data)
+            return sensor_aggregator
+        elif sensor_type == OPENTSDB_SENSOR_TYPE:
+            if not config.get('opentsdb_host') and not config.get('opentsdb_port'):
+                log.debug("No OpenTSDB host and port provided")
+                return
+            sensor_aggregator = OpenTSDB(config.get('opentsdb_host'), config.get('opentsdb_port'))
+            return sensor_aggregator
+        elif sensor_type is None:
+            return
+        else:
+            log.warning("Unsupported sensor type '%s'" % sensor_type)
+            return
+
     def _shutdown_domain(self, domain):
         """Terminates all nodes for a domain and removes it.
 
         Expected to be called in several iterations of the decider loop until
         all instances are terminated.
-        """ 
+        """
         with EpuLoggerThreadSpecific(domain=domain.domain_id, user=domain.owner):
 
             instances = [i for i in domain.get_instances()
@@ -210,16 +414,24 @@ class EPUMDecider(object):
                 log.debug("terminating %s", instance_id_s)
                 c = self.controls[domain.key]
                 try:
-                    c.destroy_instances(instance_id_s, caller=domain.owner)
+                    c.destroy_instances(instance_id_s)
                 except Exception:
                     log.exception("Error destroying instances")
             else:
                 log.debug("domain has no instances left, removing")
                 try:
+                    # Domain engine may not exist yet
+                    if domain.key in self.engines:
+                        try:
+                            self.engines[domain.key].dying()
+                        except Exception:
+                            log.exception("Error calling engine.dying()")
+
+                        del self.engines[domain.key]
+                        del self.controls[domain.key]
+
                     self.epum_store.remove_domain(domain.owner, domain.domain_id)
-                    self.engines[domain.key].dying()
-                    del self.engines[domain.key]
-                    del self.controls[domain.key]
+
                 except Exception:
                     # these should all happen atomically... not sure what to do.
                     log.exception("cleaning up a removed domain did not go well")
@@ -243,6 +455,14 @@ class EPUMDecider(object):
             else:
                 prov_vars = engine_prov_vars
 
+            # fold Chef credential name into provisioner vars if it is present
+            chef_credential = general_config.get(EPUM_CONF_CHEF_CREDENTIAL)
+            if chef_credential:
+                if prov_vars:
+                    prov_vars[EPUM_CONF_CHEF_CREDENTIAL] = chef_credential
+                else:
+                    prov_vars = {EPUM_CONF_CHEF_CREDENTIAL: chef_credential}
+
             engine = EngineLoader().load(engine_class)
             control = ControllerCoreControl(self.provisioner_client, domain, prov_vars,
                                         self.epum_store.epum_service_name())
@@ -252,11 +472,31 @@ class EPUMDecider(object):
             self.engine_config_versions[domain.key] = version
             self.controls[domain.key] = control
 
+    def _retry_domain_pending_actions(self, domain, instances):
+        """resend messages to Provisioner for any unacked launch or kill requests
+        """
+        control = self.controls[domain.key]
+        to_terminate = None
+        for instance_id, instance in instances.iteritems():
+            if instance.state == InstanceState.REQUESTING:
+                control.execute_instance_launch(instance)
+            elif instance.state == InstanceState.TERMINATING:
+                if to_terminate is None:
+                    to_terminate = [instance_id]
+                else:
+                    to_terminate.append(instance_id)
+
+        if to_terminate is not None:
+            control.execute_instance_terminations(to_terminate)
+
 
 class ControllerCoreControl(Control):
+
+    # how often, at minimum, to allow retries of launches or terminations
+    _retry_seconds = 5.0
+
     def __init__(self, provisioner_client, domain, prov_vars, controller_name, health_not_checked=True):
         super(ControllerCoreControl, self).__init__()
-        self.sleep_seconds = 5.0 # TODO: ignored for now on a per-engine basis
         self.provisioner = provisioner_client
         self.domain = domain
         self.controller_name = controller_name
@@ -265,6 +505,10 @@ class ControllerCoreControl(Control):
         else:
             self.prov_vars = {}
         self.health_not_checked = health_not_checked
+
+        # maps of instance IDs -> time.time() timestamp of last attempt
+        self._last_instance_launch = {}
+        self._last_instance_term = {}
 
     def configure(self, parameters):
         """
@@ -282,17 +526,11 @@ class ControllerCoreControl(Control):
             log.info("ControllerCoreControl is configured, no parameters")
             return
 
-        if parameters.has_key("timed-pulse-irregular"):
-            sleep_ms = int(parameters["timed-pulse-irregular"])
-            self.sleep_seconds = sleep_ms / 1000.0
-            # TODO: ignored for now on a per-engine basis
-            #log.info("Configured to pulse every %.2f seconds" % self.sleep_seconds)
-
-        if parameters.has_key(PROVISIONER_VARS_KEY):
+        if PROVISIONER_VARS_KEY in parameters:
             self.prov_vars = parameters[PROVISIONER_VARS_KEY]
-            log.info("Configured with new provisioner vars:\n%s" % self.prov_vars)
+            log.info("Configured with new provisioner vars:\n%s", self.prov_vars)
 
-    def launch(self, deployable_type_id, site, allocation, count=1, extravars=None, caller=None):
+    def launch(self, deployable_type_id, site, allocation, count=1, extravars=None):
         """
         Choose instance IDs for each instance desired, a launch ID and send
         appropriate message to Provisioner.
@@ -313,46 +551,52 @@ class ControllerCoreControl(Control):
             raise NotImplementedError("Only single-node launches are supported")
 
         launch_id = str(uuid.uuid4())
-        log.info("Request for DT '%s' is a new launch with id '%s'" % (deployable_type_id, launch_id))
-        new_instance_id_list = []
+        log.info("Request for DT '%s' is a new launch with id '%s'", deployable_type_id, launch_id)
 
-        for i in range(count):
-            new_instance_id = str(uuid.uuid4())
-            self.domain.new_instance_launch(deployable_type_id, new_instance_id, launch_id,
-                                  site, allocation)
-            new_instance_id_list.append(new_instance_id)
-
-        vars_send = self.prov_vars.copy()
         if extravars:
-            vars_send.update(extravars)
+            extravars = deepcopy(extravars)
+        else:
+            extravars = None
 
-        # The node_id var is the reason only single-node launches are supported.
-        # It could be instead added by the provisioner or something? It also
-        # is complicated by the contextualization system.
-        vars_send['node_id'] = new_instance_id_list[0]
-        vars_send['heartbeat_dest'] = self.controller_name
+        new_instance_id = str(uuid.uuid4())
+        instance = self.domain.new_instance_launch(deployable_type_id,
+            new_instance_id, launch_id, site, allocation, extravars=extravars)
+        new_instance_id_list = (new_instance_id,)
 
-        # hide passwords from logging
-        hide_password = deepcopy(vars_send)
-        if 'cassandra_password' in hide_password:
-            hide_password['cassandra_password'] = '*****'
-        if 'broker_password' in hide_password:
-            hide_password['broker_password'] = '*****'
-
-        log.debug("Launching with parameters:\n%s" % str(hide_password))
-
-        subscribers = (self.controller_name,)
-
-        self.provisioner.provision(launch_id, new_instance_id_list,
-            deployable_type_id, subscribers, site=site,
-            allocation=allocation, vars=vars_send, caller=caller)
-        extradict = {"launch_id":launch_id,
-                     "new_instance_ids":new_instance_id_list,
-                     "subscribers":subscribers}
+        self.execute_instance_launch(instance)
+        extradict = {"launch_id": launch_id,
+                     "new_instance_ids": new_instance_id_list}
         cei_events.event("controller", "new_launch", extra=extradict)
         return launch_id, new_instance_id_list
 
-    def destroy_instances(self, instance_list, caller=None):
+    def execute_instance_launch(self, instance):
+
+        instance_id = instance.instance_id
+
+        # don't retry instance launches too quickly
+        last_attempt = self._last_instance_launch.get(instance_id)
+        now = time.time()
+        if last_attempt and now - last_attempt < self._retry_seconds:
+            return
+        self._last_instance_launch[instance_id] = now
+
+        vars_send = self.prov_vars.copy()
+        if instance.extravars:
+            vars_send.update(instance.extravars)
+        # The node_id var is the reason only single-node launches are supported.
+        # It could be instead added by the provisioner or something? It also
+        # is complicated by the contextualization system.
+        vars_send['node_id'] = instance.instance_id
+        vars_send['heartbeat_dest'] = self.controller_name
+
+        new_instance_id_list = (instance.instance_id,)
+        caller = self.domain.owner
+
+        self.provisioner.provision(instance.launch_id, new_instance_id_list,
+            instance.deployable_type, site=instance.site,
+            allocation=instance.allocation, vars=vars_send, caller=caller)
+
+    def destroy_instances(self, instance_list):
         """Terminate particular instances.
 
         Control API method, see the decision engine implementer's guide.
@@ -362,7 +606,24 @@ class ControllerCoreControl(Control):
         @exception Exception illegal input/unknown ID(s)
         @exception Exception message not sent
         """
-        self.provisioner.terminate_nodes(instance_list, caller=caller)
+        # update instance states -> TERMINATING
+        for instance_id in instance_list:
+            self.domain.mark_instance_terminating(instance_id)
 
-    def destroy_all(self):
-        self.provisioner.terminate_all()
+        self.execute_instance_terminations(instance_list)
+
+    def execute_instance_terminations(self, instance_ids):
+
+        to_terminate = []
+        for instance_id in instance_ids:
+
+            # don't retry instance terminations too quickly
+            last_attempt = self._last_instance_term.get(instance_id)
+            now = time.time()
+            if not last_attempt or now - last_attempt >= self._retry_seconds:
+                to_terminate.append(instance_id)
+                self._last_instance_term[instance_id] = now
+
+        if to_terminate:
+            caller = self.domain.owner
+            self.provisioner.terminate_nodes(to_terminate, caller=caller)

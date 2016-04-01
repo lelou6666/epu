@@ -1,11 +1,19 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import threading
+import time
 from math import ceil
-from itertools import islice
 from copy import deepcopy
+from collections import defaultdict
+from operator import attrgetter
 
 from epu.exceptions import WriteConflictError, NotFoundError
-from epu.states import ProcessState
+from epu.states import ProcessState, ProcessDispatcherState, ExecutionResourceState
+from epu.processdispatcher.modes import QueueingMode
+from epu.processdispatcher.engines import domain_id_from_engine
+from epu.processdispatcher.util import get_process_state_message, \
+    get_set_difference
 
 log = logging.getLogger(__name__)
 
@@ -19,29 +27,47 @@ class PDMatchmaker(object):
       watches on the persistence for updates from other workers.
     - Pulls process requests from a queue and matches them to available slots.
 
-    While there are any engine updates, process them. Otherwise, if there are
-    any slots available
+    The matchmaker attempts to fill up nodes, but balance processes across
+    resources on a node. So for example say you have two blank nodes each with
+    two execution resources, and each of those with four slots. If you start
+    four processes, you'll end up with one node with two processes on each
+    resource. The other node will be blank. If you start four more processes,
+    they will slot onto the already-occupied node and the second node will
+    still be empty. A ninth process will finally spill onto the second node.
     """
 
-    def __init__(self, store, resource_client, ee_registry, epum_client,
-                 notifier, service_name, base_domain_config):
+    def __init__(self, core, store, resource_client, ee_registry, epum_client,
+                 notifier, service_name, domain_definition_id,
+                 base_domain_config, run_type, restart_throttling_config,
+                 dispatch_retry_seconds=0):
         """
+        @type core: ProcessDispatcherCore
         @type store: ProcessDispatcherStore
         @type resource_client: EEAgentClient
         @type ee_registry: EngineRegistry
         @type notifier: SubscriberNotifier
         """
+        self.core = core
         self.store = store
         self.resource_client = resource_client
         self.ee_registry = ee_registry
         self.epum_client = epum_client
         self.notifier = notifier
         self.service_name = service_name
+        self.domain_definition_id = domain_definition_id
         self.base_domain_config = base_domain_config
+        self.run_type = run_type
+        self._cached_pd_state = None
+        self.restart_throttling_config = restart_throttling_config
+
+        self.process_launcher = ProcessLauncher(store, resource_client, run_type,
+                                                retry_seconds=dispatch_retry_seconds)
 
         self.resources = None
         self.queued_processes = None
         self.stale_processes = None
+        self.throttled_processes = None
+        self.unscheduled_pending_processes = []
 
         self.condition = threading.Condition()
 
@@ -63,17 +89,22 @@ class PDMatchmaker(object):
         """
         if self.is_leader:
             # already the leader???
-            raise Exception("already the leader???")
-        self.is_leader = True
+            raise Exception("Elected as Matchmaker but already initialized. This worker is in an inconsistent state!")
+        try:
+            self.is_leader = True
 
-        self.initialize()
-        self.run()
+            self.initialize()
+            self.run()
+        finally:
+            # ensure flag is cleared in case of unhandled error
+            self.is_leader = False
 
     def initialize(self):
 
         self.resources = {}
         self.queued_processes = []
         self.stale_processes = []
+        self.throttled_processes = []
 
         self.resource_set_changed = True
         self.changed_resources = set()
@@ -82,39 +113,54 @@ class PDMatchmaker(object):
         self.needs_matchmaking = True
 
         self.registered_needs = {}
+        self._get_pending_processes()
+
+        self._create_missing_domains()
+
+    def _create_missing_domains(self):
 
         # create the domains if they don't already exist
         if self.epum_client:
             for engine in list(self.ee_registry):
 
+                if not self.domain_definition_id:
+                    raise Exception("domain definition must be provided")
+
                 if not self.base_domain_config:
                     raise Exception("domain config must be provided")
 
-                domain_id = self._get_domain_id(engine.engine_id)
+                domain_id = domain_id_from_engine(engine.engine_id)
                 try:
                     self.epum_client.describe_domain(domain_id)
                 except NotFoundError:
                     config = self._get_domain_config(engine)
-                    self.epum_client.add_domain(domain_id, config,
-                        subscriber_name=self.service_name, subscriber_op='dt_state')
+                    self.epum_client.add_domain(domain_id,
+                        self.domain_definition_id, config,
+                        subscriber_name=self.service_name,
+                        subscriber_op='node_state')
 
     def queued_processes_by_engine(self, engine_id):
         procs = []
         for p in self.queued_processes:
             proc = self.store.get_process(p[0], p[1])
-            if proc and proc.constraints.get('engine') == engine_id:
-                procs.append(proc)
-            elif engine_id == self.ee_registry.default and not proc.constraints.get('engine'):
+            if not proc:
+                continue
+
+            # get_process_constraints is guaranteed to have an engine set
+            constraints = self.core.get_process_constraints(proc)
+            if constraints['engine'] == engine_id:
                 procs.append(proc)
         return procs
 
-    def stale_processes_by_engine(self, engine_id):
+    def pending_processes_by_engine(self, engine_id):
         procs = []
-        for p in self.stale_processes:
-            proc = self.store.get_process(p[0], p[1])
-            if proc and proc.constraints.get('engine') == engine_id:
-                procs.append(proc)
-            elif engine_id == self.ee_registry.default and not proc.constraints.get('engine'):
+        for proc in self.unscheduled_pending_processes:
+            if not proc:
+                continue
+
+            # get_process_constraints is guaranteed to have an engine set
+            constraints = self.core.get_process_constraints(proc)
+            if constraints['engine'] == engine_id:
                 procs.append(proc)
         return procs
 
@@ -127,15 +173,35 @@ class PDMatchmaker(object):
     def engine(self, engine_id):
         return self.ee_registry.get_engine_by_id(engine_id)
 
-    def _get_domain_id(self, engine_id):
-        return "pd_domain_%s" % engine_id
-
     def _get_domain_config(self, engine, initial_n=0):
         config = deepcopy(self.base_domain_config)
         engine_conf = config['engine_conf']
         if engine_conf is None:
             config['engine_conf'] = engine_conf = {}
-        engine_conf['deployable_type'] = engine.deployable_type
+
+        if engine.deployable_type:
+            engine_conf['deployable_type'] = engine.deployable_type
+
+        if engine.iaas_allocation:
+            engine_conf['iaas_allocation'] = engine.iaas_allocation
+
+        if engine.maximum_vms:
+            engine_conf['maximum_vms'] = engine.maximum_vms
+
+        if engine.config:
+            engine_conf.update(engine.config)
+
+        if engine_conf.get('provisioner_vars') is None:
+            engine_conf['provisioner_vars'] = {}
+
+        if engine_conf['provisioner_vars'].get('slots') is None:
+            engine_conf['provisioner_vars']['slots'] = engine.slots
+
+        if engine_conf['provisioner_vars'].get('replicas') is None:
+            engine_conf['provisioner_vars']['replicas'] = engine.replicas
+
+        engine_conf['provisioner_vars']['heartbeat'] = engine.heartbeat_period.total_seconds()
+
         engine_conf['preserve_n'] = initial_n
         return config
 
@@ -161,19 +227,48 @@ class PDMatchmaker(object):
             self.changed_resources.add(resource_id)
             self.condition.notifyAll()
 
+    def _get_pd_state(self):
+        if self._cached_pd_state != ProcessDispatcherState.OK:
+            self._cached_pd_state = self.store.get_pd_state()
+        return self._cached_pd_state
+
+    def _get_pending_processes(self):
+
+        if self._get_pd_state() == ProcessDispatcherState.SYSTEM_BOOTING:
+
+            if self.unscheduled_pending_processes != []:
+                # This list shouldn't change while the system is booting
+                # so if it is set, we can safely skip querying the store
+                # for processes
+                return
+
+            process_ids = self.store.get_process_ids()
+            for process_id in process_ids:
+                process = self.store.get_process(process_id[0], process_id[1])
+                if process.state == ProcessState.UNSCHEDULED_PENDING:
+                    self.unscheduled_pending_processes.append(process)
+        elif self.unscheduled_pending_processes:
+            self.unscheduled_pending_processes = []
+
     def _get_queued_processes(self):
         self.process_set_changed = False
         processes = self.store.get_queued_processes(
             watcher=self._notify_process_set_changed)
 
-        #TODO not really caring about priority or queue order
-        # at this point
+        if processes != self.queued_processes:
+            added, removed = get_set_difference(set(self.queued_processes), set(processes))
 
-        for process_handle in processes:
-            if process_handle not in self.queued_processes:
-                log.debug("Found new queued process: %s", process_handle)
-                self.queued_processes.append(process_handle)
+            if self.process_launcher.supports_retries and removed:
+                # find processes which were removed from queue and drop them from process launcher
+                for process_key in removed:
+                    if process_key in self.process_launcher:
+                        del self.process_launcher[process_key]
 
+            log.debug("Queued process list has changed")
+            self.queued_processes = processes
+
+            if added:
+                # only need to matchmake when processes are added to queue
                 self.needs_matchmaking = True
 
     def _get_resource_set(self):
@@ -211,7 +306,6 @@ class PDMatchmaker(object):
         for resource_id in changed:
             resource = self.store.get_resource(resource_id,
                                                watcher=self._notify_resource_changed)
-            #TODO fold in assignment vector in some fancy way?
             if resource:
                 self.resources[resource_id] = resource
 
@@ -237,6 +331,8 @@ class PDMatchmaker(object):
             if self.changed_resources:
                 self._get_resources()
 
+            self._check_throttled_processes()
+
             # check again if we lost leadership
             if not self.is_leader:
                 return
@@ -250,105 +346,158 @@ class PDMatchmaker(object):
             if not self.needs_matchmaking and self.epum_client:
                 self.register_needs()
 
+            # retry any pending process launches
+            next_process_retry = None
+            if self.process_launcher.supports_retries:
+                next_process_retry = self.process_launcher.retry_process_dispatches()
+
             with self.condition:
                 if self.is_leader and not (self.resource_set_changed or
                         self.changed_resources or self.process_set_changed):
-                    self.condition.wait()
+                    timeout = self._time_until_throttling_ends()
+
+                    # don't sleep as long if we anticipate retrying again soon
+                    if next_process_retry is not None:
+                        if timeout is None:
+                            timeout = next_process_retry
+                        else:
+                            timeout = min(timeout, next_process_retry)
+
+                    if timeout > 0 or timeout is None:
+                        self.condition.wait(timeout)
 
     def matchmake(self):
-        # this is inefficient but that is ok for now
+        self._create_missing_domains()
 
-        resources = self.get_available_resources()
-        log.debug("Matchmaking. Processes: %d  Available resources: %d",
-                  len(self.queued_processes), len(resources))
+        node_containers = self.get_available_resources()
+        log.debug("Matchmaking. Processes: %d  Available nodes: %d",
+                  len(self.queued_processes), len(node_containers))
 
         fresh_processes = self._get_fresh_processes()
 
         for owner, upid, round in list(fresh_processes):
-            log.debug("Matching process %s", upid)
+            try:
+                self._matchmake_process(owner, upid, round, node_containers)
 
-            process = self.store.get_process(owner, upid)
-            if not (process and process.round == round and
-                    process.state < ProcessState.PENDING):
-                try:
-                    self.store.remove_queued_process(owner, upid, round)
-                except NotFoundError:
-                    # no problem if some other process removed the queue entry
-                    pass
-
-                self.queued_processes.remove((owner, upid, round))
-                continue
-
-            # ensure process is not already assigned a slot
-            matched_resource = self._find_assigned_resource(owner, upid, round)
-            if matched_resource:
-                log.debug("process already assigned to resource %s",
-                    matched_resource.resource_id)
-            if not matched_resource and resources:
-                matched_resource = matchmake_process(process, resources)
-
-            if matched_resource:
-                # update the resource record
-
-                if not matched_resource.is_assigned(owner, upid, round):
-                    matched_resource.assigned.append((owner, upid, round))
-                try:
-                    self.store.update_resource(matched_resource)
-                except WriteConflictError:
-                    log.info("WriteConflictError!")
-
-                    # in case of write conflict, bail out of the matchmaker
-                    # run and the outer loop will take care of updating data
-                    # and trying again
-                    return
-
-                # attempt to also update the process record and mark it as pending.
-                # If the process has since been terminated, this update will fail.
-                # In that case we must back out the resource record update we just
-                # made.
-                process, assigned = self._maybe_update_assigned_process(
-                    process, matched_resource)
-
-                if assigned:
-                    #TODO move this to a separate operation that MM submits to queue?
-                    self.resource_client.launch_process(
-                        matched_resource.resource_id, process.upid, process.round,
-                        process.spec.get('run_type'), process.spec.get('parameters'))
-
-                else:
-                    # backout resource record update if the process update failed due to
-                    # 3rd party changes to the process.
-                    log.debug("failed to assign process. it moved to %s out of band",
-                        process.state)
-                    matched_resource, removed = self._backout_resource_assignment(
-                        matched_resource, process)
-
-                # either way, remove resource from consideration if no slots remain
-                if not matched_resource.available_slots and matched_resource in resources:
-                    resources.remove(matched_resource)
-
-                self.store.remove_queued_process(owner, upid, round)
-                self.queued_processes.remove((owner, upid, round))
-
-            elif process.state < ProcessState.WAITING:
-                self._mark_process_waiting(process)
-
-                # remove rejected processes from the queue
-                if process.state == ProcessState.REJECTED:
-                    self.store.remove_queued_process(owner, upid, round)
-                    self.queued_processes.remove((owner, upid, round))
-
-            self._mark_process_stale((owner, upid, round))
+            except (WriteConflictError, NotFoundError):
+                # some write conflict errors are allowed to bubble up,
+                # meaning we should bail out of matchmaking loop and
+                # let outer loop update data and retry
+                return
 
         # if we made it through all processes, we don't need to matchmake
         # again until new information arrives
         self.needs_matchmaking = False
 
+    def _matchmake_process(self, owner, upid, round, node_containers):
+        log.debug("Matching process %s", upid)
+
+        process = self.store.get_process(owner, upid)
+        if not (process and process.round == round and
+                process.state < ProcessState.PENDING):
+            self._remove_queued_process(owner, upid, round)
+            return
+
+        # don't rematch processes in ASSIGNED state -- we are awaiting
+        # acknowledgment from an EE Agent
+        if process.state == ProcessState.ASSIGNED:
+
+            # ensure process is under control of launcher retries --
+            # we could be recovering from a matchmaker failure
+            if self.process_launcher.supports_retries:
+                if process.key not in self.process_launcher:
+                    self.process_launcher.dispatch_process(process)
+            return
+
+        if self._throttle_end_time(process) > time.time():
+            self._throttle_process(process)
+            return
+
+        # ensure process is not already assigned a slot
+        matched_resource = self._find_assigned_resource(owner, upid, round)
+        if matched_resource:
+            log.debug("process already assigned to resource %s",
+                matched_resource.resource_id)
+
+        if not matched_resource and node_containers:
+            matched_resource = self.matchmake_process(process, node_containers)
+
+        if matched_resource:
+            self._handle_matched_process(process, matched_resource, node_containers)
+
+        elif process.state < ProcessState.WAITING:
+            self._mark_process_waiting(process)
+
+            # remove rejected processes from the queue
+            if process.state == ProcessState.REJECTED:
+                self._remove_queued_process(owner, upid, round)
+
+        self._mark_process_stale((owner, upid, round))
+
+    def _handle_matched_process(self, process, matched_resource, node_containers):
+        # update the resource record
+        if not matched_resource.is_assigned(process.owner, process.upid, process.round):
+            matched_resource.assigned.append((process.owner, process.upid, process.round))
+        try:
+            self.store.update_resource(matched_resource)
+        except (WriteConflictError, NotFoundError):
+            log.info("Conflict error updating resource. will retry.")
+
+            # in case of write conflict, bail out of the matchmaker
+            # run and the outer loop will take care of updating data
+            # and trying again
+            raise
+
+        matched_node = None
+        if process.node_exclusive:
+            matched_node = self.store.get_node(matched_resource.node_id)
+            if matched_node is None:
+                log.error("Couldn't find node %s to update node_exclusive",
+                        matched_resource.node_id)
+            else:
+                self.core.node_add_exclusive_tags(matched_node, [process.node_exclusive])
+
+        # attempt to also update the process record and mark it as pending.
+        # If the process has since been terminated, this update will fail.
+        # In that case we must back out the resource record update we just
+        # made.
+        process, assigned = self._maybe_update_assigned_process(
+            process, matched_resource)
+
+        if assigned:
+            self.process_launcher.dispatch_process(process)
+
+        else:
+            # backout resource record update if the process update failed due to
+            # 3rd party changes to the process.
+            log.debug("failed to assign process. it moved to %s out of band",
+                process.state)
+            matched_resource, removed = self._backout_resource_assignment(
+                matched_resource, process)
+
+            if process.node_exclusive:
+                self.core.node_remove_exclusive_tags(matched_node,
+                    [process.node_exclusive])
+
+        # update modified resource's node container and prune it out
+        # if the node has no more available slots
+        for i, node_container in enumerate(node_containers):
+            if matched_resource.node_id == node_container.node_id:
+                node_container.update()
+                if matched_node:
+                    node_container.update_node(matched_node)
+                if not node_container.available_slots:
+                    node_containers.pop(i)
+                break  # there can only be one match
+
+        self._remove_queued_process(process.owner, process.upid, process.round)
+
     def _maybe_update_assigned_process(self, process, resource):
         updated = False
-        while process.state < ProcessState.PENDING:
+        while process.state < ProcessState.ASSIGNED:
             process.assigned = resource.resource_id
-            process.state = ProcessState.PENDING
+            process.state = ProcessState.ASSIGNED
+            process.increment_dispatches()
 
             # pull hostname directly onto process record, if available.
             # it is commonly desired information and this saves the need to
@@ -358,6 +507,8 @@ class PDMatchmaker(object):
             try:
                 self.store.update_process(process)
                 updated = True
+
+                log.info(get_process_state_message(process))
 
             except WriteConflictError:
                 process = self.store.get_process(process.owner, process.upid)
@@ -382,19 +533,16 @@ class PDMatchmaker(object):
 
         return resource, removed
 
-    def _set_resource_enabled_state(self, resource, enabled):
-        updated = False
-        while resource and resource.enabled != enabled:
-            resource.enabled = enabled
+    def _remove_queued_process(self, owner, upid, round):
             try:
-                self.store.update_resource(resource)
-                updated = True
-            except WriteConflictError:
-                resource = self.store.get_resource(resource.resource_id)
+                self.store.remove_queued_process(owner, upid, round)
             except NotFoundError:
-                resource = None
-
-        return resource, updated
+                # no problem if some other process removed the queue entry
+                pass
+            try:
+                self.queued_processes.remove((owner, upid, round))
+            except ValueError:
+                pass
 
     def _mark_process_waiting(self, process):
 
@@ -404,10 +552,30 @@ class PDMatchmaker(object):
 
         updated = False
         while process.state < ProcessState.WAITING:
-            if process.immediate:
+            if process.queueing_mode == QueueingMode.NEVER:
                 process.state = ProcessState.REJECTED
-                log.info("Process %s: no available slots. REJECTED due to immediate flag",
+                log.info("Process %s: no available slots. REJECTED due to NEVER queueing mode",
                          process.upid)
+            elif process.queueing_mode == QueueingMode.START_ONLY:
+                if process.starts == 0:
+                    log.info("Process %s: no available slots. WAITING in queue",
+                         process.upid)
+                    process.state = ProcessState.WAITING
+                else:
+                    process.state = ProcessState.REJECTED
+                    log.info("Process %s: no available slots. REJECTED due to "
+                             "START_ONLY queueing mode, and process has "
+                             "started before.", process.upid)
+            elif process.queueing_mode == QueueingMode.RESTART_ONLY:
+                if process.starts == 0:
+                    process.state = ProcessState.REJECTED
+                    log.info("Process %s: no available slots. REJECTED due to "
+                             "RESTART_ONLY queueing mode, and process hasn't "
+                             "started before.", process.upid)
+                else:
+                    log.info("Process %s: no available slots. WAITING in queue",
+                         process.upid)
+                    process.state = ProcessState.WAITING
             else:
                 log.info("Process %s: no available slots. WAITING in queue",
                          process.upid)
@@ -425,6 +593,51 @@ class PDMatchmaker(object):
 
         return process, updated
 
+    def _throttle_process(self, process):
+        self._mark_process_waiting(process)
+        self.throttled_processes.append(process)
+
+    def _time_until_throttling_ends(self):
+        process_throttle_times = []
+        for process in self.throttled_processes:
+            process_throttle_times.append(self._throttle_end_time(process))
+        try:
+            throttle_end_time = min(process_throttle_times)
+            time_until_throttling_ends = throttle_end_time - time.time()
+            return time_until_throttling_ends
+        except ValueError:
+            return None
+
+    def _check_throttled_processes(self):
+        if self._time_until_throttling_ends() <= 0:
+            self.throttled_processes = []
+            self.needs_matchmaking = True
+
+    def _throttle_end_time(self, process):
+        minimum_time_between_starts = None
+        try:
+            minimum_time_between_starts = float(self.restart_throttling_config['minimum_time_between_starts'])
+        except Exception:
+            # We might still be able to get a config from process config
+            pass
+
+        try:
+            minimum_time_between_starts = float(process.configuration['process']['minimum_time_between_starts'])
+        except Exception:
+            # ignore if we can't get a config for this process
+            pass
+
+        # if there isn't a minimum time configured, never throttle
+        if minimum_time_between_starts is None:
+            return 0
+
+        # Process only needs throttling if it has been restarted at least once
+        if len(process.dispatch_times) <= 1:
+            return 0
+
+        last_start = max(process.dispatch_times)
+        return last_start + minimum_time_between_starts
+
     def _mark_process_stale(self, process):
         self.stale_processes.append(process)
 
@@ -437,70 +650,168 @@ class PDMatchmaker(object):
         return fresh_processes
 
     def get_available_resources(self):
-        available = []
-        for resource in self.resources.itervalues():
-            log.debug("Examining %s", resource)
-            if resource.enabled and resource.available_slots:
-                available.append(resource)
+        """Select the available execution resources
 
-        # sort by 1) whether any processes are already assigned to resource
-        # and 2) number of available slots
-        available.sort(key=lambda r: (0 if r.assigned else 1,
-                                      r.slot_count - len(r.assigned)))
-        return available
+        Returns a sorted list of NodeContainer objects
+        """
+
+        # first break down available resources by node
+        available_by_node = defaultdict(list)
+        for resource in self.resources.itervalues():
+
+            # only consider OK resources. We definitely don't want to consider
+            # MISSING or DISABLED resources. We could arguably include WARNING
+            # resources, but perhaps at a lower priority than OK.
+
+            if resource.state == ExecutionResourceState.OK and resource.available_slots:
+                node_id = resource.node_id
+                available_by_node[node_id].append(resource)
+
+        # now create NodeResources container objects for each node,
+        # splitting unoccupied nodes off into a separate list
+        unoccupied_node_containers = []
+        node_containers = []
+        for node_id, resources in available_by_node.iteritems():
+            container = NodeContainer(node_id, resources)
+
+            if any(resource.assigned for resource in resources):
+                node_containers.append(container)
+            else:
+                unoccupied_node_containers.append(container)
+
+        # sort the occupied nodes by the aggregate number of available slots
+        node_containers.sort(key=attrgetter('available_slots'))
+
+        # append the unoccupied node lists onto the end
+        node_containers.extend(unoccupied_node_containers)
+        return node_containers
 
     def calculate_need(self, engine_id):
-        queued_process_count = len(self.queued_processes_by_engine(engine_id))
-        assigned_process_count = 0
-        occupied_resource_count = 0
+
+        # track a set of all known processes, both assigned and queued. it
+        # is possible for there to be some brief overlap between assigned
+        # and queued processes, where round N of a process is assigned and
+        # round N+1 is requeued.
+        process_set = set()
+        occupied_node_set = set()
+        node_set = set()
+
+        for process in self.pending_processes_by_engine(engine_id):
+            process_set.add((process.owner, process.upid))
+
+        for process in self.queued_processes_by_engine(engine_id):
+            process_set.add((process.owner, process.upid))
 
         resources = self.resources_by_engine(engine_id)
         for resource in resources.itervalues():
-            assigned_count = len(resource.assigned)
-            if assigned_count:
-                assigned_process_count += assigned_count
-                occupied_resource_count += 1
+            if resource.assigned:
+                for owner, upid, _ in resource.assigned:
+                    process_set.add((owner, upid))
+                occupied_node_set.add(resource.node_id)
 
-        process_count = queued_process_count + assigned_process_count
+            node_set.add(resource.node_id)
 
         # need is the greater of the base need, the number of occupied
         # resources, and the number of instances that could be occupied
         # by the current process set
         engine = self.engine(engine_id)
-        return max(engine.base_need, occupied_resource_count,
-                int(ceil(process_count / float(engine.slots))))
+
+        # total number of unique runnable processes in the system plus
+        # minimum free slots
+        process_count = len(process_set) + engine.spare_slots
+
+        process_need = int(ceil(process_count / float(engine.slots * engine.replicas)))
+        need = max(engine.base_need, len(occupied_node_set), process_need)
+        if engine.maximum_vms is not None:
+            need = min(need, engine.maximum_vms)
+            log.debug("Engine '%s' need=%d = min(maximum_vms=%d, max(base_need=%d, occupied=%d, process_need=%d))",
+            engine_id, need, engine.maximum_vms, engine.base_need, len(occupied_node_set), process_need)
+        else:
+            log.debug("Engine '%s' need=%d = max(base_need=%d, occupied=%d, process_need=%d)",
+                engine_id, need, engine.base_need, len(occupied_node_set), process_need)
+        return need, list(node_set - occupied_node_set)
 
     def register_needs(self):
-        # TODO real dumb.
+
+        self._get_pending_processes()
 
         for engine in list(self.ee_registry):
 
             engine_id = engine.engine_id
 
-            need = self.calculate_need(engine_id)
+            need, unoccupied_nodes = self.calculate_need(engine_id)
             registered_need = self.registered_needs.get(engine_id)
             if need != registered_need:
-                log.debug("need %s != registered_needs %s" % (need, registered_need))
 
                 retiree_ids = None
                 # on scale down, request for specific nodes to be terminated
                 if need < registered_need:
-                    retirables = (r for r in self.resources.itervalues()
-                        if r.enabled and not r.assigned)
-                    retirees = list(islice(retirables, registered_need - need))
-                    retiree_ids = []
-                    for retiree in retirees:
-                        self._set_resource_enabled_state(retiree, False)
-                        retiree_ids.append(retiree.node_id)
 
-                    log.debug("Retiring empty nodes: %s", retirees)
+                    unoccupied_nodes.sort(key=self._node_state_time, reverse=True)
+                    retiree_ids = unoccupied_nodes[:registered_need - need]
+                    for resource in self.resources.itervalues():
+                        if resource.node_id in retiree_ids:
+                            self.core.resource_change_state(resource,
+                                ExecutionResourceState.DISABLED)
 
-                log.debug("Reconfiguring need for %d %s instances (was %s)",
-                        need, engine_id, self.registered_needs.get(engine_id, 0))
+                log.info("Scaling engine '%s' to %s nodes (was %s)",
+                        engine_id, need, self.registered_needs.get(engine_id, 0))
+                if retiree_ids:
+                    log.info("Retiring engine '%s' nodes: %s", engine_id, ", ".join(retiree_ids))
                 config = get_domain_reconfigure_config(need, retiree_ids)
-                domain_id = self._get_domain_id(engine_id)
+                domain_id = domain_id_from_engine(engine_id)
                 self.epum_client.reconfigure_domain(domain_id, config)
                 self.registered_needs[engine_id] = need
+
+    def _node_state_time(self, node_id):
+        node = self.store.get_node(node_id)
+        if node:
+            return node.state_time
+        else:
+            return 0
+
+    def matchmake_process(self, process, node_containers):
+        constraints = self.core.get_process_constraints(process)
+
+        # node_resources is a list of NodeResources objects. each contains a
+        # sublist of resources.
+        for node_container in node_containers:
+
+            # skip ahead by whole nodes if we care about node exclusivity
+            if process.node_exclusive:
+                node_id = node_container.node_id
+
+                # grab node object out of data store and cache it on the
+                # container
+                if node_container.node is None:
+                    node = node_container.node = self.store.get_node(node_id)
+                else:
+                    node = node_container.node
+
+                if not node:
+                    log.warning("Can't find node %s?", node_id)
+                    continue
+                if not node.node_exclusive_available(process.node_exclusive):
+                    log.debug("Process %s with node_exclusive %s is not being "
+                              "matched to %s, which has this attribute" % (
+                                  process.upid, process.node_exclusive, node_id))
+                    continue
+
+            # now inspect each resource in the node looking for a match
+            for resource in node_container.resources:
+                logstr = "%s: process %s constraints: %s against resource %s properties: %s"
+                if match_constraints(constraints, resource.properties):
+                    log.debug(logstr, "MATCH", process.upid, constraints,
+                        resource.resource_id, resource.properties)
+
+                    return resource
+
+                else:
+                    log.debug(logstr, "NOTMATCH", process.upid, process.constraints,
+                        resource.resource_id, resource.properties)
+
+        # no match was found!
+        return None
 
 
 def get_domain_reconfigure_config(preserve_n, retirables=None):
@@ -508,16 +819,6 @@ def get_domain_reconfigure_config(preserve_n, retirables=None):
     if retirables:
         engine_conf['retirable_nodes'] = list(retirables)
     return dict(engine_conf=engine_conf)
-
-
-def matchmake_process(process, resources):
-    matched = None
-    for resource in resources:
-        log.debug("checking %s", resource.resource_id)
-        if match_constraints(process.constraints, resource.properties):
-            matched = resource
-            break
-    return matched
 
 
 def match_constraints(constraints, properties):
@@ -547,3 +848,163 @@ def match_constraints(constraints, properties):
                 return False
 
     return True
+
+
+def _get_process_config(process):
+    """gets process config dictionary, adding in start_mode if necessary
+
+    Returns None if no configuration is needed
+    """
+
+    if process.round == 0:
+        if process.configuration:
+            return process.configuration
+
+    else:
+        if process.configuration:
+            config = deepcopy(process.configuration)
+            process_block = config.get('process')
+            if process_block is None or not isinstance(process_block, dict):
+                process_block = config['process'] = {}
+        else:
+            config = {}
+            process_block = config['process'] = {}
+
+        process_block['start_mode'] = "RESTART"
+        return config
+
+    return None
+
+
+class ProcessLauncher(object):
+    def __init__(self, store, resource_client, run_type, retry_seconds=0):
+        self.store = store
+        self.resource_client = resource_client
+        self.run_type = run_type
+        if retry_seconds and retry_seconds > 0:
+            self.retry_seconds = float(retry_seconds)
+            self.supports_retries = True
+        else:
+            self.supports_retries = False
+            self.retry_seconds = 0
+
+        # map of pending process owner/ID pairs to last dispatch times
+        self.pending_process_dispatches = {}
+
+    def __contains__(self, item):
+        return item in self.pending_process_dispatches
+
+    def __delitem__(self, item):
+        del self.pending_process_dispatches[item]
+
+    def dispatch_process(self, process):
+        """Launches a process onto a resource.
+
+        If retries are enabled, the process will be queued for retry
+        until it is acknowledged or canceled.
+        """
+        if self.retry_seconds:
+            self.pending_process_dispatches[process.key] = time.time()
+
+        self._do_dispatch(process)
+
+    def _do_dispatch(self, process):
+        assert process.state == ProcessState.ASSIGNED
+        resource_id = process.assigned
+        parameters = self._get_process_parameters(process)
+        try:
+            log.info("Dispatching process %s (round %s) to EEAgent resource %s",
+                     process.upid, process.round, resource_id)
+            self.resource_client.launch_process(
+                resource_id, process.upid, process.round,
+                self.run_type, parameters)
+        except Exception:
+            log.warn("Problem dispatching process %s to EEAgent %s. Will retry.",
+                process.upid, resource_id, exc_info=True)
+
+    def _get_process_parameters(self, process):
+        definition = process.definition
+        executable = definition['executable']
+        if self.run_type in ('pyon', 'pyon_single'):
+            parameters = dict(name=process.name,
+                module=executable['module'], cls=executable['class'],
+                module_uri=executable.get('url'))
+            config = _get_process_config(process)
+            if config is not None:
+                parameters['config'] = config
+        elif self.run_type == 'supd':
+            parameters = executable
+        else:
+            msg = "Don't know how to format parameters for '%s' run type" % self.run_type
+            log.warning(msg)
+            parameters = {}
+        return parameters
+
+    def retry_process_dispatches(self):
+        """Retries unacknowledged dispatch requests older than retry_seconds
+
+        Returns seconds until next retry
+        """
+        global_next_retry = None
+        now = time.time()
+        for process_key, last_time in self.pending_process_dispatches.items():
+            next_retry = last_time + self.retry_seconds
+            if next_retry <= now:
+                owner, upid, round = process_key
+                process = self.store.get_process(owner, upid)
+                if not (process and process.round == round
+                        and process.state == ProcessState.ASSIGNED):
+                    # if the process has moved on to another round or state,
+                    # drop it from our set and move on
+                    del self.pending_process_dispatches[process_key]
+                    continue
+
+                # otherwise, re-attempt the request
+                self._do_dispatch(process)
+                self.pending_process_dispatches[process_key] = now + self.retry_seconds
+            else:
+                if global_next_retry is None or next_retry < global_next_retry:
+                    global_next_retry = next_retry
+
+        if global_next_retry is None:
+            return None
+
+        return max(global_next_retry - time.time(), 0)
+
+
+class NodeContainer(object):
+    """Represents the execution resources on a single node (VM)
+
+    Used only internally in matchmaking algorithm. Keeps the node's resources
+    sorted by their available slot count, descending. This way the matchmaker
+    will favor less-utilized resources on each node. Note that among the full
+    set of nodes, the matchmaker favors utilized nodes first. So the net effect
+    is that we fill up nodes but balance processes across all containers on
+    each node as we go.
+    """
+    def __init__(self, node_id, resources):
+        self.node_id = node_id
+        self.resources = list(resources)
+        self.node = None
+
+        # sort the resource list to begin with
+        self.update()
+
+    @property
+    def available_slots(self):
+        return sum(r.available_slots for r in self.resources)
+
+    def update(self):
+        """Ensure the resource set is sorted and available
+
+        Prunes any resources that have no free slots.
+        """
+        resources = self.resources
+        resources.sort(key=attrgetter('available_slots'), reverse=True)
+
+        # walk from the end of list and prune off resources with no free slots
+        while resources and resources[-1].available_slots == 0:
+            resources.pop()
+
+    def update_node(self, new_node):
+        self.node = new_node

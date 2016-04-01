@@ -1,13 +1,25 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import string
 
-import json
+import simplejson as json
 from xml.dom.minidom import Document
 
-from epu.exceptions import DeployableTypeLookupError, DeployableTypeValidationError, NotFoundError
+from epu.exceptions import DeployableTypeLookupError, DeployableTypeValidationError, \
+    NotFoundError, BadRequestError
 from epu.dtrs.store import sanitize_record
+from epu.provisioner.sites import validate_site
+from epu.util import is_valid_identifier
 
 log = logging.getLogger(__name__)
+
+
+class CredentialType(object):
+    SITE = "site"
+    CHEF = "chef"
+
+    VALID_CREDENTIAL_TYPES = (SITE, CHEF)
 
 
 class DTRSCore(object):
@@ -18,36 +30,48 @@ class DTRSCore(object):
         """
         self.store = store
 
-    def add_credentials(self, caller, site_name, site_credentials):
-        site = self.store.describe_site(site_name)
-        if not site:
-            raise NotFoundError
+    def add_site(self, caller, site_name, site_definition):
+        validate_site(site_definition)
+        return self.store.add_site(caller, site_name, site_definition)
 
-        return self.store.add_credentials(caller, site_name, site_credentials)
+    def update_site(self, caller, site_name, site_definition):
+        validate_site(site_definition)
+        return self.store.update_site(caller, site_name, site_definition)
 
-    def describe_credentials(self, caller, site_name):
-        ret = self.store.describe_credentials(caller, site_name)
+    def add_credentials(self, caller, credential_type, name, credentials):
+        validate_credentials(credential_type, name, credentials)
+
+        if credential_type == CredentialType.SITE:
+            site = self.store.describe_site(caller, name)
+            if site is None:
+                raise NotFoundError("Cannot add credentials for unknown site %s" % name)
+
+        log.info("Adding %s credentials '%s' for user %s", credential_type, name, caller)
+        return self.store.add_credentials(caller, credential_type, name, credentials)
+
+    def describe_credentials(self, caller, credential_type, name):
+        ret = self.store.describe_credentials(caller, credential_type, name)
         return sanitize_record(ret)
 
     def describe_dt(self, caller, dt_name):
         ret = self.store.describe_dt(caller, dt_name)
         return sanitize_record(ret)
 
-    def describe_site(self, site_name):
-        ret = self.store.describe_site(site_name)
+    def describe_site(self, caller, site_name):
+        ret = self.store.describe_site(caller, site_name)
         return sanitize_record(ret)
 
     def lookup(self, caller, dt_name, dtrs_request_node, vars):
-        # TODO Implement contextualization with deep merging of variables
 
+        log.debug("lookup dt %s for user %s" % (dt_name, caller))
         dt = self.store.describe_dt(caller, dt_name)
-        if not dt:
+        if dt is None:
             raise DeployableTypeLookupError("Unknown deployable type name: %s" % dt_name)
 
         # dtrs_request_node contains:
         # - instance count (assuming one for now)
         # - site
-        # - allocation (ignored for now)
+        # - allocation
         try:
             site = dtrs_request_node['site']
         except KeyError:
@@ -69,8 +93,12 @@ class DTRSCore(object):
         except KeyError:
             raise DeployableTypeLookupError('iaas_allocation missing in mappings of DT %s and site %s', dt_name, site)
 
-        site_credentials = self.store.describe_credentials(caller, site)
-        if not site_credentials:
+        allocation = dtrs_request_node.get("allocation")
+        if allocation is not None:
+            iaas_allocation = allocation
+
+        site_credentials = self.store.describe_credentials(caller, CredentialType.SITE, site)
+        if site_credentials is None:
             raise DeployableTypeLookupError('Credentials missing for caller %s and site %s', caller, site)
 
         try:
@@ -78,19 +106,69 @@ class DTRSCore(object):
         except KeyError:
             raise DeployableTypeLookupError('key_name missing from credentials of caller %s and site %s', caller, site)
 
+        response_node = {
+            'iaas_image': iaas_image,
+            'iaas_allocation': iaas_allocation,
+            'iaas_sshkeyname': iaas_sshkeyname,
+            'needs_elastic_ip': bool(site_mapping.get('needs_elastic_ip', False)),
+        }
+
+        ctx_method = 'chef-solo'
+
+        # this value controls whether the Provisioner will attempt to create a Nimbus context
+        # for the VM.
+        needs_nimbus_ctx = True
         contextualization = dt.get('contextualization')
-        if contextualization:
-            ctx_method = contextualization.get('method')
+        if contextualization and contextualization.get('method'):
+            ctx_method = contextualization['method']
             if ctx_method == 'chef-solo':
                 try:
                     chef_json = contextualization['chef_config']
                 except KeyError:
                     raise DeployableTypeValidationError(dt_name, 'Missing chef_config in DT definition')
                 document = generate_cluster_document(iaas_image, chef_json=chef_json)
+
+            elif ctx_method == 'chef':
+                needs_nimbus_ctx = False
+                response_node['chef_runlist'] = contextualization.get('run_list', [])
+                response_node['chef_attributes'] = contextualization.get('attributes', {})
+                document = generate_cluster_document(iaas_image)
+
+                # A chef credential name should be present in the vars, otherwise assume default "chef"
+                if vars:
+                    chef_credential_name = vars.get('chef_credential', 'chef')
+                else:
+                    chef_credential_name = 'chef'
+                chef_credentials = self.store.describe_credentials(caller,
+                    CredentialType.CHEF, chef_credential_name)
+                if chef_credentials is None:
+                    raise DeployableTypeLookupError('Chef credentials %s missing for caller %s' %
+                        (chef_credential_name, caller))
+                response_node['chef_credential'] = chef_credential_name
+
+            elif ctx_method == 'userdata':
+                needs_nimbus_ctx = False
+                try:
+                    userdata = contextualization['userdata']
+                except KeyError:
+                    raise DeployableTypeValidationError(dt_name, 'Missing userdata in DT definition')
+                if isinstance(userdata, dict):
+                    try:
+                        userdata = str(userdata[site])
+                    except KeyError:
+                        raise DeployableTypeValidationError(dt_name, 'Missing site %s for multi-site userdata in DT definition' % site)
+                else:
+                    userdata = str(userdata)
+
+                document = generate_cluster_document(iaas_image)
+                response_node['iaas_userdata'] = userdata
             else:
                 raise DeployableTypeValidationError(dt_name, 'Unknown contextualization method %s' % ctx_method)
         else:
             document = generate_cluster_document(iaas_image)
+
+        response_node['ctx_method'] = ctx_method
+        response_node['needs_nimbus_ctx'] = needs_nimbus_ctx
 
         all_vars = {}
         if vars:
@@ -105,13 +183,19 @@ class DTRSCore(object):
         except ValueError, e:
             raise DeployableTypeValidationError(dt_name, 'Deployable type document has bad variable: %s' % str(e))
 
-        response_node = {
-                'iaas_image' : iaas_image,
-                'iaas_allocation' : iaas_allocation,
-                'iaas_sshkeyname' : iaas_sshkeyname,
-        }
         result = {'document': document, 'node': response_node}
         return result
+
+
+def validate_credentials(credentials_type, name, credentials):
+    if credentials_type not in CredentialType.VALID_CREDENTIAL_TYPES:
+        raise BadRequestError("Invalid credentials type '%s'" % (credentials_type,))
+
+    if not is_valid_identifier(name):
+        raise BadRequestError("Invalid credentials name '%s'" % (name,))
+
+    if not (credentials and isinstance(credentials, dict)):
+        raise BadRequestError("Invalid credentials block")
 
 
 def process_vars(vars, dt_name):
@@ -135,6 +219,7 @@ def process_vars(vars, dt_name):
             vars[key] = json.dumps(value)
 
     return vars
+
 
 def generate_cluster_document(image, name="domain_instance", quantity=1,
                               nic="public", wantlogin="true", chef_json=None):
@@ -184,7 +269,7 @@ def generate_cluster_document(image, name="domain_instance", quantity=1,
     requires_el.appendChild(requires_identity_el)
 
     if chef_json:
-        chef_config_string= json.dumps(chef_json)
+        chef_config_string = json.dumps(chef_json)
         data_el = doc.createElement("data")
         data_el.setAttribute("name", "dt-chef-solo")
         requires_el.appendChild(data_el)

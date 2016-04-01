@@ -1,4 +1,5 @@
-#!/usr/bin/env python
+# Copyright 2013 University of Chicago
+
 
 """
 @file epu/provisioner/store.py
@@ -8,36 +9,43 @@
 from itertools import groupby
 import logging
 import threading
+import simplejson as json
+import socket
+import os
 
-import gevent
-import json
+from kazoo.client import KazooClient, KazooState
+from kazoo.exceptions import NodeExistsException, BadVersionException,\
+    NoNodeException
+from kazoo.recipe.party import Party
 
-# conditionally import these so we can use the in-memory store without ZK
-try:
-    from kazoo.client import KazooClient, KazooState, EventType, make_digest_acl
-    from kazoo.exceptions import NodeExistsException, BadVersionException, \
-        NoNodeException
-    from kazoo.recipe.leader import LeaderElection
-    from kazoo.recipe.party import ZooParty
-
-except ImportError:
-    KazooClient = None
-    KazooState = None
-    EventType = None
-    make_digest_acl = None
-    LeaderElection = None
-    NodeExistsException = None
-    BadVersionException = None
-    NoNodeException = None
-    ZooParty = None
-
-
+import epu.tevent as tevent
 from epu.exceptions import WriteConflictError, NotFoundError
+from epu import zkutil
 
 
 log = logging.getLogger(__name__)
 
 VERSION_KEY = "__version"
+
+
+def get_provisioner_store(config, use_gevent=False, proc_name=None):
+    """Instantiate Provisioner store object for the given configuration
+    """
+    if zkutil.is_zookeeper_enabled(config):
+        zookeeper = zkutil.get_zookeeper_config(config)
+
+        log.info("Using ZooKeeper Provisioner store")
+        store = ProvisionerZooKeeperStore(zookeeper['hosts'],
+            zookeeper['path'], username=zookeeper.get('username'),
+            password=zookeeper.get('password'), timeout=zookeeper.get('timeout'),
+            proc_name=proc_name, use_gevent=use_gevent)
+
+    else:
+        log.info("Using in-memory Provisioner store")
+        store = ProvisionerStore()
+
+    return store
+
 
 class ProvisionerStore(object):
     """In-memory version of Provisioner storage
@@ -57,6 +65,14 @@ class ProvisionerStore(object):
 
     def initialize(self):
         pass
+
+    def shutdown(self):
+        # In-memory store, only stop the leaders
+        try:
+            if self.is_leading:
+                self._break_leader()
+        except Exception, e:
+            log.exception("Error cancelling leader: %s", e)
 
     def is_disabled(self):
         """Indicates that the Provisioner is in disabled mode, which means
@@ -98,7 +114,7 @@ class ProvisionerStore(object):
         assert not self.is_leading
         self.is_leading = True
 
-        self.leader_thread = gevent.spawn(self.leader.inaugurate)
+        self.leader_thread = tevent.spawn(self.leader.inaugurate)
 
     # for tests
     def _break_leader(self):
@@ -107,7 +123,6 @@ class ProvisionerStore(object):
 
         self.leader.depose()
         self.leader_thread.join()
-
 
     #########################################################################
     # LAUNCHES
@@ -185,7 +200,6 @@ class ProvisionerStore(object):
             del self.launches[launch_id]
         else:
             raise NotFoundError()
-
 
     #########################################################################
     # NODES
@@ -299,7 +313,7 @@ class ProvisionerStore(object):
     def get_terminating(self):
         if not self.terminating:
             with self.termination_condition:
-                self.termination_condition.wait()
+                self.termination_condition.wait(timeout=0.1)
 
         return self.terminating.keys()
 
@@ -342,23 +356,27 @@ class ProvisionerZooKeeperStore(object):
     # termination.
     TERMINATING_PATH = "/TERMINATING"
 
-    def __init__(self, hosts, base_path, username=None, password=None, timeout=None):
-        self.kazoo = KazooClient(hosts, timeout=timeout, namespace=base_path)
-        self.election = LeaderElection(self.kazoo, self.ELECTION_PATH)
-        self.party = ZooParty(self.kazoo, self.PARTICIPANT_PATH)
+    def __init__(self, hosts, base_path, username=None, password=None,
+                 timeout=None, use_gevent=False, proc_name=None):
 
-        if username and password:
-            self.kazoo_auth_scheme = "digest"
-            self.kazoo_auth_credential = "%s:%s" % (username, password)
-            self.kazoo.default_acl = [make_digest_acl(username, password, all=True)]
-        elif username or password:
-            raise Exception("both username and password must be specified, if any")
-        else:
-            self.kazoo_auth_scheme = None
-            self.kazoo_auth_credential = None
+        kwargs = zkutil.get_kazoo_kwargs(username=username, password=password,
+                                         timeout=timeout, use_gevent=use_gevent)
+        self.kazoo = KazooClient(hosts + base_path, **kwargs)
+
+        self.retry = zkutil.get_kazoo_retry()
+
+        if not proc_name:
+            proc_name = ""
+        zk_id = "%s:%s:%d" % (proc_name, socket.gethostname(), os.getpid())
+
+        log.info("Election id %s participating on %s" % (zk_id, self.ELECTION_PATH))
+        self.election = self.kazoo.Election(self.ELECTION_PATH, identifier=zk_id)
+        self.party = Party(self.kazoo, self.PARTICIPANT_PATH)
 
         #  callback fired when the connection state changes
         self.kazoo.add_listener(self._connection_state_listener)
+
+        self._shutdown = False
 
         self._election_enabled = False
         self._election_condition = threading.Condition()
@@ -370,46 +388,58 @@ class ProvisionerZooKeeperStore(object):
         self._disabled_condition = threading.Condition()
 
     def initialize(self):
-
-        self.kazoo.connect()
-        if self.kazoo_auth_scheme:
-            self.kazoo.add_auth(self.kazoo_auth_scheme, self.kazoo_auth_credential)
+        self._shutdown = False
+        self.kazoo.start()
 
         for path in (self.LAUNCH_PATH, self.NODE_PATH, self.TERMINATING_PATH):
             self.kazoo.ensure_path(path)
 
     def shutdown(self):
-        # depose the leader and cancel the election just in case
+        with self._election_condition:
+            self._shutdown = True
+            self._election_enabled = False
+            self._election_condition.notify_all()
+
         try:
-            self._leader.depose()
+            if self._leader:
+                self._leader.depose()
         except Exception, e:
             log.exception("Error deposing leader: %s", e)
 
         self.election.cancel()
-        self._election_thread.kill()
-        self.kazoo.close()
+
+        if self._election_thread:
+            self._election_thread.join()
+        self.kazoo.stop()
+        try:
+            self.kazoo.close()
+        except Exception:
+            log.exception("Problem cleaning up kazoo")
 
     def _connection_state_listener(self, state):
         # called by kazoo when the connection state changes.
         # handle in background
-        gevent.spawn(self._handle_connection_state, state)
+        tevent.spawn(self._handle_connection_state, state)
 
     def _handle_connection_state(self, state):
 
         if state in (KazooState.LOST, KazooState.SUSPENDED):
+            log.debug("disabling election and leader")
             with self._election_condition:
                 self._election_enabled = False
                 self._election_condition.notify_all()
 
             # depose the leader and cancel the election just in case
             try:
-                self._leader.depose()
+                if self._leader:
+                    self._leader.depose()
             except Exception, e:
                 log.exception("Error deposing leader: %s", e)
 
             self.election.cancel()
 
         elif state == KazooState.CONNECTED:
+            log.debug("enabling election")
             with self._election_condition:
                 self._election_enabled = True
                 self._election_condition.notify_all()
@@ -417,14 +447,14 @@ class ProvisionerZooKeeperStore(object):
             self._update_disabled_state()
 
     def _disabled_watch(self, event):
-        gevent.spawn(self._update_disabled_state)
+        tevent.spawn(self._update_disabled_state)
 
     def _update_disabled_state(self):
         with self._disabled_condition:
 
             # check if the node exists and set up a callback
-            exists = self.kazoo.exists(self.DISABLED_PATH,
-                self._disabled_watch)
+            exists = self.retry(self.kazoo.exists, self.DISABLED_PATH,
+                                self._disabled_watch)
             if exists:
                 if not self._disabled:
                     log.warn("Detected provisioner DISABLED state began")
@@ -457,13 +487,13 @@ class ProvisionerZooKeeperStore(object):
         of all VMs as part of system shutdown
         """
 
-        return not self.party.get_participant_count()
+        return not len(self.party)
 
     def enable_provisioning(self):
         """Allow new instance launches
         """
         try:
-            self.kazoo.delete(self.DISABLED_PATH)
+            self.retry(self.kazoo.delete, self.DISABLED_PATH)
         except NoNodeException:
             pass
 
@@ -471,7 +501,7 @@ class ProvisionerZooKeeperStore(object):
         """Disallow new instance launches
         """
         try:
-            self.kazoo.create(self.DISABLED_PATH, "")
+            self.retry(self.kazoo.create, self.DISABLED_PATH, "")
         except NodeExistsException:
             pass
 
@@ -480,20 +510,28 @@ class ProvisionerZooKeeperStore(object):
         """
         assert self._leader is None
         self._leader = leader
-        self._election_thread = gevent.spawn(self._run_election)
+        self._election_thread = tevent.spawn(self._run_election,
+                                             self.election, leader, "leader")
 
-    def _run_election(self):
+    def _run_election(self, election, leader, name):
         """Election thread function
         """
         while True:
             with self._election_condition:
                 while not self._election_enabled:
+                    if self._shutdown:
+                        return
+                    log.debug("%s election waiting for to be enabled", name)
                     self._election_condition.wait()
-
-                try:
-                    self.election.run(self._leader.inaugurate)
-                except Exception, e:
-                    log.exception("Error in leader election: %s", e)
+                if self._shutdown:
+                    return
+            try:
+                election.run(leader.inaugurate)
+            except Exception, e:
+                log.exception("Error in %s election: %s", name, e)
+            except:
+                log.exception("Unhandled error in election")
+                raise
 
     #########################################################################
     # LAUNCHES
@@ -514,7 +552,7 @@ class ProvisionerZooKeeperStore(object):
 
         value = json.dumps(launch)
         try:
-            self.kazoo.create(self._make_launch_path(launch_id), value)
+            self.retry(self.kazoo.create, self._make_launch_path(launch_id), value)
         except NodeExistsException:
             raise WriteConflictError()
 
@@ -536,14 +574,14 @@ class ProvisionerZooKeeperStore(object):
         value = json.dumps(launch)
 
         try:
-            stat = self.kazoo.set(self._make_launch_path(launch_id), value,
+            stat = self.retry(self.kazoo.set, self._make_launch_path(launch_id), value,
                 version)
         except BadVersionException:
             raise WriteConflictError()
         except NoNodeException:
             raise NotFoundError()
 
-        launch[VERSION_KEY] = stat['version']
+        launch[VERSION_KEY] = stat.version
 
     def get_launch(self, launch_id):
         """
@@ -552,12 +590,12 @@ class ProvisionerZooKeeperStore(object):
         @retval launch dictionary or None if not found
         """
         try:
-            data, stat = self.kazoo.get(self._make_launch_path(launch_id))
+            data, stat = self.retry(self.kazoo.get, self._make_launch_path(launch_id))
         except NoNodeException:
             return None
 
         launch = json.loads(data)
-        launch[VERSION_KEY] = stat['version']
+        launch[VERSION_KEY] = stat.version
         return launch
 
     def get_launches(self, state=None, min_state=None, max_state=None):
@@ -569,7 +607,7 @@ class ProvisionerZooKeeperStore(object):
         @retval list of launch records
         """
         try:
-            children = self.kazoo.get_children(self.LAUNCH_PATH)
+            children = self.retry(self.kazoo.get_children, self.LAUNCH_PATH)
         except NoNodeException:
             raise NotFoundError()
 
@@ -588,10 +626,9 @@ class ProvisionerZooKeeperStore(object):
         @return:
         """
         try:
-            self.kazoo.delete(self._make_launch_path(launch_id))
+            self.retry(self.kazoo.delete, self._make_launch_path(launch_id))
         except NoNodeException:
             raise NotFoundError()
-
 
     #########################################################################
     # NODES
@@ -611,7 +648,7 @@ class ProvisionerZooKeeperStore(object):
         node_id = node['node_id']
         value = json.dumps(node)
         try:
-            self.kazoo.create(self._make_node_path(node_id), value)
+            self.retry(self.kazoo.create, self._make_node_path(node_id), value)
         except NodeExistsException:
             raise WriteConflictError()
 
@@ -633,14 +670,14 @@ class ProvisionerZooKeeperStore(object):
         value = json.dumps(node)
 
         try:
-            stat = self.kazoo.set(self._make_node_path(node_id), value,
+            stat = self.retry(self.kazoo.set, self._make_node_path(node_id), value,
                 version)
         except BadVersionException:
             raise WriteConflictError()
         except NoNodeException:
             raise NotFoundError()
 
-        node[VERSION_KEY] = stat['version']
+        node[VERSION_KEY] = stat.version
 
     def get_node(self, node_id):
         """
@@ -649,12 +686,12 @@ class ProvisionerZooKeeperStore(object):
         @retval node record or None if not found
         """
         try:
-            data, stat = self.kazoo.get(self._make_node_path(node_id))
+            data, stat = self.retry(self.kazoo.get, self._make_node_path(node_id))
         except NoNodeException:
             return None
 
         node = json.loads(data)
-        node[VERSION_KEY] = stat['version']
+        node[VERSION_KEY] = stat.version
         return node
 
     def get_nodes(self, state=None, min_state=None, max_state=None):
@@ -666,7 +703,7 @@ class ProvisionerZooKeeperStore(object):
         @retval Deferred list of launch records
         """
         try:
-            children = self.kazoo.get_children(self.NODE_PATH)
+            children = self.retry(self.kazoo.get_children, self.NODE_PATH)
         except NoNodeException:
             raise NotFoundError()
 
@@ -682,7 +719,7 @@ class ProvisionerZooKeeperStore(object):
         """Remove a node record from the store
         """
         try:
-            self.kazoo.delete(self._make_node_path(node_id))
+            self.retry(self.kazoo.delete, self._make_node_path(node_id))
         except NoNodeException:
             raise NotFoundError()
 
@@ -702,23 +739,21 @@ class ProvisionerZooKeeperStore(object):
         @raise WriteConflictError if node exists
         """
         try:
-            self.kazoo.create(self._make_terminating_path(node_id), node_id)
+            # make sure to use ascii data value
+            self.retry(self.kazoo.create, self._make_terminating_path(node_id), str(node_id))
         except NodeExistsException:
             raise WriteConflictError()
 
     def get_terminating(self):
         def get_children():
             try:
-                children = self.kazoo.get_children(self.TERMINATING_PATH)
+                children = self.retry(self.kazoo.get_children, self.TERMINATING_PATH)
             except NoNodeException:
                 raise NotFoundError()
 
             return children
 
         children = get_children()
-        while not children:
-            gevent.sleep(1)
-            children = get_children()
 
         records = []
         for node_id in children:
@@ -727,7 +762,7 @@ class ProvisionerZooKeeperStore(object):
 
     def remove_terminating(self, node_id):
         try:
-            self.kazoo.delete(self._make_terminating_path(node_id))
+            self.retry(self.kazoo.delete, self._make_terminating_path(node_id))
         except NoNodeException:
             raise NotFoundError()
 

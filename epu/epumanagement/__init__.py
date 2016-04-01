@@ -1,19 +1,20 @@
+# Copyright 2013 University of Chicago
+
 import logging
 
 from epu.epumanagement.reactor import EPUMReactor
 from epu.epumanagement.doctor import EPUMDoctor
 from epu.epumanagement.decider import EPUMDecider
-from epu.epumanagement.store import LocalEPUMStore, ZooKeeperEPUMStore
+from epu.epumanagement.reaper import EPUMReaper
 from epu.epumanagement.core import DomainSubscribers
 from epu.epumanagement.conf import EPUM_INITIALCONF_EXTERNAL_DECIDE,\
-    CONF_IAAS_SITE, EPUM_INITIALCONF_DEFAULT_NEEDY_IAAS,\
-    EPUM_INITIALCONF_DEFAULT_NEEDY_IAAS_ALLOC, CONF_IAAS_ALLOCATION,\
-    PROVISIONER_VARS_KEY, EPUM_INITIALCONF_SERVICE_NAME, \
-    EPUM_DEFAULT_SERVICE_NAME, EPUM_INITIALCONF_ZOOKEEPER_HOSTS, \
-    EPUM_INITIALCONF_ZOOKEEPER_PATH, EPUM_INITIALCONF_PERSISTENCE,\
-    EPUM_INITIALCONF_ZOOKEEPER_PASSWORD, EPUM_INITIALCONF_ZOOKEEPER_USERNAME
+    EPUM_INITIALCONF_DEFAULT_NEEDY_IAAS,\
+    EPUM_INITIALCONF_DEFAULT_NEEDY_IAAS_ALLOC,\
+    PROVISIONER_VARS_KEY, EPUM_RECORD_REAPING_DEFAULT_MAX_AGE,\
+    EPUM_CONF_DECIDER_LOOP_INTERVAL, EPUM_DECIDER_DEFAULT_LOOP_INTERVAL
 
 log = logging.getLogger(__name__)
+
 
 class EPUManagement(object):
     """
@@ -25,8 +26,8 @@ class EPUManagement(object):
     in test/dev situations to bypass the messaging layer altogether.
     """
 
-    def __init__(self, initial_conf, notifier, provisioner_client,
-                 ouagent_client, epum_client=None, store=None):
+    def __init__(self, initial_conf, notifier, provisioner_client, ouagent_client, dtrs_client, epum_client=None,
+                 store=None, statsd_cfg=None):
         """Given a configuration, instantiate all EPUM roles and objects
 
         INITIAL_CONF dict:
@@ -44,8 +45,10 @@ class EPUManagement(object):
         @param notifier Subscriber notifier (See clients.py)
         @param provisioner_client ProvisionerClient instance (See clients.py)
         @param ouagent_client OUAgentClient instance (See clients.py)
+        @param dtrs_client DTRSClient
         @param epum_client EPUManagement client (See clients.py). If None, uses self (in-memory).
         @param store EPUMStore implementation, or None
+        @param statsd_cfg statsd configuration dict, or None
         """
 
         self.initialized = False
@@ -61,6 +64,9 @@ class EPUManagement(object):
         if not provisioner_client:
             raise ValueError("Provisioner client is required")
 
+        if not dtrs_client:
+            raise ValueError("DTRS client is required")
+
         # See self.msg_register_need()
         self.needy_default_iaas_site = initial_conf.get(EPUM_INITIALCONF_DEFAULT_NEEDY_IAAS, None)
         self.needy_default_iaas_alloc = initial_conf.get(EPUM_INITIALCONF_DEFAULT_NEEDY_IAAS_ALLOC, None)
@@ -70,47 +76,26 @@ class EPUManagement(object):
         # See self._run_decisions() and self._doctor_appt()
         self._external_decide_mode = initial_conf.get(EPUM_INITIALCONF_EXTERNAL_DECIDE, False)
 
-        self.service_name = initial_conf.get(EPUM_INITIALCONF_SERVICE_NAME, EPUM_DEFAULT_SERVICE_NAME)
-
         base_provisioner_vars = initial_conf.get(PROVISIONER_VARS_KEY)
 
         self.domain_subscribers = DomainSubscribers(notifier)
 
-        if store:
-            self.epum_store = store
-        else:
-            store_type = initial_conf.get(EPUM_INITIALCONF_PERSISTENCE)
-            if store_type == "zookeeper":
-                hosts = initial_conf.get(EPUM_INITIALCONF_ZOOKEEPER_HOSTS)
-                if not hosts:
-                    raise Exception("expected EPUM config: %s" %
-                                    EPUM_INITIALCONF_ZOOKEEPER_HOSTS)
-                path = initial_conf.get(EPUM_INITIALCONF_ZOOKEEPER_PATH)
-                if not path:
-                    raise Exception("expected EPUM config: %s" %
-                                    EPUM_INITIALCONF_ZOOKEEPER_PATH)
-
-                username = initial_conf.get(EPUM_INITIALCONF_ZOOKEEPER_USERNAME)
-                password = initial_conf.get(EPUM_INITIALCONF_ZOOKEEPER_PASSWORD)
-                self.epum_store = ZooKeeperEPUMStore(self.service_name, hosts,
-                    path, username=username, password=password)
-            else:
-                self.epum_store = LocalEPUMStore(self.service_name)
-
-        self.epum_store.initialize()
+        self.epum_store = store
 
         # The instance of the EPUManagementService process that hosts a particular EPUMReactor instance
         # might not be configured to receive messages.  But when it is receiving messages, they all go
         # to the EPUMReactor instance.
         self.reactor = EPUMReactor(self.epum_store, self.domain_subscribers, provisioner_client, epum_client)
-        
+
         # The instance of the EPUManagementService process that hosts a particular EPUMDecider instance
         # might not be the elected decider.  When it is the elected decider, its EPUMDecider instance
         # handles that functionality.  When it is not the elected decider, its EPUMDecider instance
         # handles being available in the election.
-        self.decider = EPUMDecider(self.epum_store, self.domain_subscribers,
-            provisioner_client, epum_client, disable_loop=self._external_decide_mode,
-            base_provisioner_vars=base_provisioner_vars)
+        decider_loop_interval = initial_conf.get(EPUM_CONF_DECIDER_LOOP_INTERVAL,
+            EPUM_DECIDER_DEFAULT_LOOP_INTERVAL)
+        self.decider = EPUMDecider(self.epum_store, self.domain_subscribers, provisioner_client, epum_client,
+                dtrs_client, disable_loop=self._external_decide_mode, base_provisioner_vars=base_provisioner_vars,
+                loop_interval=decider_loop_interval, statsd_cfg=statsd_cfg)
 
         # The instance of the EPUManagementService process that hosts a particular EPUMDoctor instance
         # might not be the elected leader.  When it is the elected leader, this EPUMDoctor handles that
@@ -119,6 +104,15 @@ class EPUManagement(object):
         self.doctor = EPUMDoctor(self.epum_store, notifier, provisioner_client, epum_client,
                                  ouagent_client, disable_loop=self._external_decide_mode)
 
+        # The instance of the EPUManagementService process that hosts a particular EPUMReaper instance
+        # might not be the elected leader.  When it is the elected leader, this EPUMReaper handles that
+        # functionality.  When it is not the elected leader, this EPUMReaper handles the constant
+        # participation in the election.
+
+        record_reaping_max_age = initial_conf.get('record_reaping_max_age',
+                                                  EPUM_RECORD_REAPING_DEFAULT_MAX_AGE)
+        self.reaper = EPUMReaper(self.epum_store, record_reaping_max_age,
+                                 disable_loop=self._external_decide_mode)
 
     def initialize(self):
         """
@@ -130,6 +124,7 @@ class EPUManagement(object):
         # from persistence and refreshes local caches.
         self.doctor.recover()
         self.decider.recover()
+        self.reaper.recover()
 
         self.initialized = True
 
@@ -150,6 +145,15 @@ class EPUManagement(object):
         if not self._external_decide_mode:
             raise Exception("Not configured to accept external doctor check invocations")
         self.doctor._loop_top(timestamp=timestamp)
+
+    def _run_reaper_loop(self):
+        """For unit and integration tests only
+        """
+        if not self.initialized:
+            raise Exception("Not initialized")
+        if not self._external_decide_mode:
+            raise Exception("Not configured to accept external decision invocations")
+        self.reaper._loop_top()
 
     # -------------------------------------------
     # External Messages: Sent by other components
@@ -185,7 +189,7 @@ class EPUManagement(object):
         """
         return self.reactor.describe_domain(caller, domain_id)
 
-    def msg_add_domain(self, caller, domain_id, config, subscriber_name=None,
+    def msg_add_domain(self, caller, domain_id, definition_id, config, subscriber_name=None,
                     subscriber_op=None):
         """Add a new Domain (logically separate Decision Engine).
 
@@ -193,11 +197,12 @@ class EPUManagement(object):
 
         @param caller Caller, if available
         @param domain_id domain name/ID
+        @param definition_id domain definition name/ID
         @param config Initial configuration, see msg_reconfigure_domain for config doc
         """
         if not self.initialized:
             raise Exception("Not initialized")
-        self.reactor.add_domain(caller, domain_id, config,
+        self.reactor.add_domain(caller, domain_id, definition_id, config,
             subscriber_name=subscriber_name, subscriber_op=subscriber_op)
 
     def msg_remove_domain(self, caller, domain_id):
@@ -311,6 +316,47 @@ class EPUManagement(object):
             raise Exception("Not initialized")
         self.reactor.reconfigure_domain(caller, domain_id, config)
 
+    def msg_add_domain_definition(self, definition_id, definition):
+        """Add a new Domain Definition
+
+        @param definition_id domain definition name/ID
+        @param definition Domain definition of the domain
+        """
+        if not self.initialized:
+            raise Exception("Not initialized")
+        self.reactor.add_domain_definition(definition_id, definition)
+
+    def msg_remove_domain_definition(self, definition_id):
+        """ Remove a domain definition
+
+        @param definition_id domain definition name/ID
+        """
+        if not self.initialized:
+            raise Exception("Not initialized")
+        self.reactor.remove_domain_definition(definition_id)
+
+    def msg_describe_domain_definition(self, definition_id):
+        """Return a state structure for a domain definition, or None
+
+        @param definition_id domain definition name/ID
+        """
+        return self.reactor.describe_domain_definition(definition_id)
+
+    def msg_list_domain_definitions(self):
+        """Return a list of domain definitions in the system
+        """
+        return self.reactor.list_domain_definitions()
+
+    def msg_update_domain_definition(self, definition_id, definition):
+        """Update the domain definition with a new definition
+
+        @param definition_id domain definition name/ID
+        @param definition New domain definition of the domain
+        """
+        if not self.initialized:
+            raise Exception("Not initialized")
+        return self.reactor.update_domain_definition(definition_id, definition)
+
     def msg_heartbeat(self, caller, content, timestamp=None):
         """ From R1: op_heartbeat
         Reactor parses content.
@@ -327,11 +373,3 @@ class EPUManagement(object):
         if not self.initialized:
             raise Exception("Not initialized")
         return self.reactor.new_instance_state(content)
-
-    def msg_sensor_info(self, caller, content):
-        """ From R1: op_sensor_info
-        Reactor parses content.
-        """
-        if not self.initialized:
-            raise Exception("Not initialized")
-        return self.reactor.new_sensor_info(content)

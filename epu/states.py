@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Copyright 2013 University of Chicago
 
 
 class InstanceState(object):
@@ -6,7 +7,7 @@ class InstanceState(object):
     """
 
     REQUESTING = '100-REQUESTING'
-    """Request has been made but not acknowledged through SA"""
+    """Request has been made but not acknowledged by Provisioner"""
 
     REQUESTED = '200-REQUESTED'
     """Request has been acknowledged by provisioner"""
@@ -64,7 +65,7 @@ class InstanceHealthState(object):
 
     # Instance is running but we haven't received a heartbeat for more than
     # missing_timeout seconds, a dump_state() message was sent, and we
-    # subsequently haven't recieved a heartbeat in really_missing_timeout
+    # subsequently haven't received a heartbeat in really_missing_timeout
     # seconds
     MISSING = "MISSING"
 
@@ -97,12 +98,12 @@ class ProcessState(object):
     ordered and any backwards movement will be accompanied by an increment of
     the round.
 
-    So for example a new process starts in Round 0 and state REQUESTING and
+    So for example a new process starts in Round 0 and state UNSCHEDULED and
     proceeds through states as it launches:
 
     Round   State
 
-    0       100-REQUESTING
+    0       100-UNSCHEDULED
     0       200-REQUESTED
     0       300-WAITING             process is waiting in a queue
     0       400-PENDING             process is assigned a slot and deploying
@@ -130,10 +131,16 @@ class ProcessState(object):
     2       700-TERMINATED
 
     """
-    REQUESTING = "100-REQUESTING"
-    """Process request has not yet been acknowledged by Process Dispatcher
 
-    This state will only exist inside of clients of the Process Dispatcher
+    UNSCHEDULED = "100-UNSCHEDULED"
+    """Process has been created but not scheduled to run. It will not be
+    scheduled until requested by the user
+    """
+
+    UNSCHEDULED_PENDING = "150-UNSCHEDULED_PENDING"
+    """Process is unscheduled but will be automatically scheduled in the
+    future. This is used by the Doctor role to hold back some processes
+    during system bootstrap.
     """
 
     REQUESTED = "200-REQUESTED"
@@ -147,24 +154,32 @@ class ProcessState(object):
     """Process was >= PENDING but died, waiting for a new slot
 
     The process is pending a decision about whether it can be immediately
-    assigned a slot or if it must wait for one to become available.
+    assigned a slot or if it must wait for one to become available (or
+    be rejected).
     """
 
     WAITING = "300-WAITING"
     """Process is waiting for a slot to become available
 
     There were no available slots when this process was reviewed by the
-    matchmaker. Processes with the immediate flag set will never reach this
-    state and will instead go straight to FAILED.
+    matchmaker. Processes which request not to be queued, by their
+    queueing mode flag will never reach this state and will go directly to
+    REJECTED.
+    """
+
+    ASSIGNED = "350-ASSIGNED"
+    """Process is deploying to a slot
+
+    Process is assigned to a slot and deployment is underway. Once a
+    process reaches this state, moving back to an earlier state requires an
+    increment of the process' round.
+
     """
 
     PENDING = "400-PENDING"
-    """Process is deploying to a slot
+    """Process is starting on a resource
 
-    A slot has been assigned to the process and deployment is underway. It
-    is quite possible for the resource or process to die before deployment
-    succeeds however. Once a process reaches this state, moving back to
-    an earlier state requires an increment of the process' round.
+    A process has been deployed to a slot and is starting.
     """
 
     RUNNING = "500-RUNNING"
@@ -190,8 +205,14 @@ class ProcessState(object):
     REJECTED = "900-REJECTED"
     """Process could not be scheduled and it was rejected
 
-    This is the terminal state of processes with the immediate flag when
-    no resources are immediately available.
+    This is the terminal state of processes with queueing mode NEVER and
+    RESTART_ONLY when no resources are immediately available, or START_ONLY
+    when there are no resources immediately available on restart
+    """
+
+    TERMINAL_STATES = (UNSCHEDULED, UNSCHEDULED_PENDING, TERMINATED, EXITED,
+                       FAILED, REJECTED)
+    """Process states which will not change without a request from outside.
     """
 
 
@@ -213,4 +234,57 @@ class HAState(object):
 
     FAILED = "FAILED"
     """HA Process has been started, but is not able to recover from a problem
+    """
+
+
+class ProcessDispatcherState(object):
+
+    UNINITIALIZED = "UNINITIALIZED"
+    """Initial state at Process Dispatcher boot. Maintained until the Doctor
+    inspects and repairs system state. During this state, no matches are made
+    and no processes are dispatched.
+    """
+
+    SYSTEM_BOOTING = "SYSTEM_BOOTING"
+    """State set after the Process Dispatcher is initialized but while the
+    system is still bootstrapping. During this time, the Matchmaker operates
+    and matches/dispatches processes. However, the doctor is potentially holding
+    back a batch of processes which will be released to the queue after the
+    system boot finishes.
+    """
+
+    OK = "OK"
+    """Process dispatcher is running and healthy
+    """
+
+    VALID_STATES = (UNINITIALIZED, SYSTEM_BOOTING, OK)
+
+
+class ExecutionResourceState(object):
+
+    OK = "OK"
+    """Resource is active and healthy
+    """
+
+    WARNING = "WARNING"
+    """The resource is under suspicion due to missing or late heartbeats
+
+    Running processes are not rescheduled yet, but the resource is not
+    assigned any new processes while in this state. Note: This could later
+    be refined to allow processes, but only if there are no compatible slots
+    available on healthy resources.
+    """
+
+    MISSING = "MISSING"
+    """The resource has been declared dead by the PD Doctor due to a prolonged
+    lack of heartbeats.
+
+    Running processes on the resource have been rescheduled (if applicable)
+    and the resource is ineligible for running new processes. If the resource
+    resumes sending heartbeats, it will be returned to the OK state and made
+    available for processes.
+    """
+
+    DISABLED = "DISABLED"
+    """The resource has been disabled, likely in advance of being terminated
     """

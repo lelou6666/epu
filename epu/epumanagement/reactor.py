@@ -1,10 +1,18 @@
+# Copyright 2013 University of Chicago
+
+import copy
 import logging
 
-from epu.epumanagement.conf import *
+from epu import cei_events
+from epu.epumanagement.conf import *  # noqa
+from epu.epumanagement.decider import DEFAULT_ENGINE_CLASS
 from epu.states import InstanceState, InstanceHealthState
 from epu.domain_log import EpuLoggerThreadSpecific
+from epu.exceptions import NotFoundError, WriteConflictError
+from epu.util import get_class
 
 log = logging.getLogger(__name__)
+
 
 class EPUMReactor(object):
     """Handles message-driven sub tasks that do not require locks for critical sections.
@@ -23,19 +31,69 @@ class EPUMReactor(object):
         self.provisioner_client = provisioner_client
         self.epum_client = epum_client
 
-    def add_domain(self, caller, domain_id, config, subscriber_name=None,
-                subscriber_op=None):
+    def add_domain(self, caller, domain_id, definition_id, config,
+                   subscriber_name=None, subscriber_op=None):
         """See: EPUManagement.msg_add_domain()
         """
         # TODO: parameters are from messages, do legality checks here
         # assert that engine_conf['epuworker_type']['sleeper'] is owned by caller
         log.debug("ADD Domain: %s", config)
 
+        # Make a copy of the definition and merge the config inside.
+        # If a definition is changed or deleted, it has no impact over any of
+        # the domains.
+        try:
+            definition = self.store.get_domain_definition(definition_id)
+        except NotFoundError:
+            raise ValueError("Domain definition does not exist: %s" % definition_id)
+
+        merged_config = copy.copy(definition.get_definition())
+
+        # Hand-made deep merge of config into definition
+        if EPUM_CONF_GENERAL in config:
+            if EPUM_CONF_GENERAL in merged_config:
+                merged_config[EPUM_CONF_GENERAL].update(config[EPUM_CONF_GENERAL])
+            else:
+                merged_config[EPUM_CONF_GENERAL] = config[EPUM_CONF_GENERAL]
+
+        if EPUM_CONF_HEALTH in config:
+            if EPUM_CONF_HEALTH in merged_config:
+                merged_config[EPUM_CONF_HEALTH].update(config[EPUM_CONF_HEALTH])
+            else:
+                merged_config[EPUM_CONF_HEALTH] = config[EPUM_CONF_HEALTH]
+
+        if EPUM_CONF_ENGINE in config:
+            if EPUM_CONF_ENGINE in merged_config:
+                merged_config[EPUM_CONF_ENGINE].update(config[EPUM_CONF_ENGINE])
+            else:
+                merged_config[EPUM_CONF_ENGINE] = config[EPUM_CONF_ENGINE]
+
+        self._validate_engine_config(merged_config)
+
         with EpuLoggerThreadSpecific(domain=domain_id, user=caller):
-            domain = self.store.add_domain(caller, domain_id, config)
+            domain = self.store.add_domain(caller, domain_id, merged_config)
 
             if subscriber_name and subscriber_op:
                 domain.add_subscriber(subscriber_name, subscriber_op)
+
+        extradict = {'user': caller, 'domain_id': domain_id,
+                'definition_id': definition_id}
+        cei_events.event("epumanagement", "new_domain", extra=extradict)
+
+    def _validate_engine_config(self, config):
+        engine_class = DEFAULT_ENGINE_CLASS
+        if EPUM_CONF_GENERAL in config:
+            general_config = config[EPUM_CONF_GENERAL]
+            if EPUM_CONF_ENGINE_CLASS in general_config:
+                engine_class = general_config[EPUM_CONF_ENGINE_CLASS]
+
+        log.debug("attempting to load Decision Engine '%s'" % engine_class)
+        kls = get_class(engine_class)
+        if not kls:
+            raise Exception("Cannot find decision engine implementation: '%s'" % engine_class)
+
+        if hasattr(kls, 'validate_config') and callable(getattr(kls, 'validate_config')):
+            kls.validate_config(config.get(EPUM_CONF_ENGINE, {}))
 
     def remove_domain(self, caller, domain_id):
         with EpuLoggerThreadSpecific(domain=domain_id, user=caller):
@@ -63,6 +121,7 @@ class EPUMReactor(object):
                 return None
             domain_desc = dict(name=domain.domain_id,
                 config=domain.get_all_config(),
+                sensor_data=domain.get_domain_sensor_data(),
                 instances=[i.to_dict() for i in domain.get_instances()])
             return domain_desc
 
@@ -75,11 +134,11 @@ class EPUMReactor(object):
             if not domain:
                 raise ValueError("Domain does not exist: %s" % domain_id)
 
-            if config.has_key(EPUM_CONF_GENERAL):
+            if EPUM_CONF_GENERAL in config:
                 domain.add_general_config(config[EPUM_CONF_GENERAL])
-            if config.has_key(EPUM_CONF_ENGINE):
+            if EPUM_CONF_ENGINE in config:
                 domain.add_engine_config(config[EPUM_CONF_ENGINE])
-            if config.has_key(EPUM_CONF_HEALTH):
+            if EPUM_CONF_HEALTH in config:
                 domain.add_health_config(config[EPUM_CONF_HEALTH])
 
     def subscribe_domain(self, caller, domain_id, subscriber_name, subscriber_op):
@@ -102,16 +161,64 @@ class EPUMReactor(object):
 
             domain.remove_subscriber(subscriber_name)
 
-    def new_sensor_info(self, content):
-        """Handle an incoming sensor message
-
-        @param content Raw sensor content
+    def add_domain_definition(self, definition_id, definition):
+        """See: EPUManagement.msg_add_domain_definition()
         """
+        log.debug("ADD Domain Definition: %s", definition)
 
-        # TODO: need a new sensor abstraction; have no way of knowing which epu_state to associate this with
-        # TODO: sensor API will change, should include a mandatory field for epu (vs. a general sensor)
-        raise NotImplementedError
-        #epu_state.new_sensor_item(content)
+        with EpuLoggerThreadSpecific(definition=definition_id):
+            definition = self.store.add_domain_definition(definition_id, definition)
+
+    def list_domain_definitions(self):
+        with EpuLoggerThreadSpecific():
+            return self.store.list_domain_definitions()
+
+    def describe_domain_definition(self, definition_id):
+        with EpuLoggerThreadSpecific(definition=definition_id):
+            try:
+                definition = self.store.get_domain_definition(definition_id)
+            except ValueError:
+                return None
+            if not definition:
+                return None
+            definition_config = definition.get_definition()
+            doc = self._get_engine_doc(definition_config)
+            definition_desc = dict(name=definition.definition_id,
+                    definition=definition_config)
+            if doc:
+                definition_desc['documentation'] = doc
+            return definition_desc
+
+    def _get_engine_doc(self, config):
+        engine_class = DEFAULT_ENGINE_CLASS
+        if EPUM_CONF_GENERAL in config:
+            general_config = config[EPUM_CONF_GENERAL]
+            if EPUM_CONF_ENGINE_CLASS in general_config:
+                engine_class = general_config[EPUM_CONF_ENGINE_CLASS]
+
+        log.debug("attempting to load Decision Engine '%s'" % engine_class)
+        kls = get_class(engine_class)
+        if not kls:
+            raise Exception("Cannot find decision engine implementation: '%s'" % engine_class)
+
+        if hasattr(kls, 'get_config_doc') and callable(getattr(kls, 'get_config_doc')):
+            doc = kls.get_config_doc()
+        else:
+            doc = kls.__doc__
+
+        return doc
+
+    def remove_domain_definition(self, definition_id):
+        with EpuLoggerThreadSpecific(definition=definition_id):
+            self.store.remove_domain_definition(definition_id)
+
+    def update_domain_definition(self, definition_id, definition):
+        with EpuLoggerThreadSpecific(definition=definition_id):
+            domain_definition = self.store.get_domain_definition(definition_id)
+            if not domain_definition:
+                raise ValueError("Domain definition does not exist: %s" % definition_id)
+
+            self.store.update_domain_definition(definition_id, definition)
 
     def new_instance_state(self, content):
         """Handle an incoming instance state message
@@ -128,28 +235,43 @@ class EPUMReactor(object):
         if instance_id:
             domain = self.store.get_domain_for_instance_id(instance_id)
             if domain:
-                log.debug("Got state %s for instance '%s'", state, instance_id)
 
-                instance = domain.get_instance(instance_id)
-                domain.new_instance_state(content, previous=instance)
+                # retry update in case of write conflict
+                instance, updated = self._maybe_update_domain_instance(
+                    domain, instance_id, content)
+                if updated:
+                    log.debug("Got state %s for instance '%s'", state, instance_id)
 
-                # The higher level clients of EPUM only see RUNNING or FAILED (or nothing)
-                if content['state'] < InstanceState.RUNNING:
-                    return
-                elif content['state'] == InstanceState.RUNNING:
-                    notify_state = InstanceState.RUNNING
+                    # The higher level clients of EPUM only see RUNNING or FAILED (or nothing)
+                    if content['state'] < InstanceState.RUNNING:
+                        return
+                    elif content['state'] == InstanceState.RUNNING:
+                        notify_state = InstanceState.RUNNING
+                    else:
+                        notify_state = InstanceState.FAILED
+                    try:
+                        self.subscribers.notify_subscribers(instance, domain, notify_state)
+                    except Exception, e:
+                        log.error("Error notifying subscribers '%s': %s",
+                            instance_id, str(e), exc_info=True)
                 else:
-                    notify_state = InstanceState.FAILED
-                try:
-                    self.subscribers.notify_subscribers(instance, domain, notify_state)
-                except Exception, e:
-                    log.error("Error notifying subscribers '%s': %s",
-                        instance_id, str(e), exc_info=True)
-
+                    log.warn("Already received a more recent state message for instance '%s'" % instance_id)
             else:
                 log.warn("Unknown Domain for state message for instance '%s'" % instance_id)
         else:
             log.error("Could not parse instance ID from state message: '%s'" % content)
+
+    def _maybe_update_domain_instance(self, domain, instance_id, msg):
+        while True:
+            instance = domain.get_instance(instance_id)
+            content = copy.deepcopy(msg)
+            try:
+                updated = domain.new_instance_state(content, previous=instance)
+                return instance, updated
+            except WriteConflictError:
+                pass
+            except NotFoundError:
+                return instance, False
 
     def new_heartbeat(self, caller, content, timestamp=None):
         """Handle an incoming heartbeat message

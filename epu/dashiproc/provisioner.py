@@ -1,17 +1,26 @@
+# Copyright 2013 University of Chicago
+
+import threading
 import logging
+import time
 
 import dashi.bootstrap as bootstrap
+try:
+    from statsd import StatsClient
+except ImportError:
+    StatsClient = None
 
 from epu.dashiproc.dtrs import DTRSClient
-from epu.provisioner.store import ProvisionerStore, ProvisionerZooKeeperStore,\
-    sanitize_record
+from epu.provisioner.store import get_provisioner_store, sanitize_record
 from epu.provisioner.core import ProvisionerCore, ProvisionerContextClient
 from epu.provisioner.leader import ProvisionerLeader
 from epu.states import InstanceState
 from epu.util import get_class, get_config_paths
 from epu.exceptions import UserNotPermittedError
+import epu.dashiproc
 
 log = logging.getLogger(__name__)
+
 
 class ProvisionerService(object):
 
@@ -29,22 +38,29 @@ class ProvisionerService(object):
             libcloud.security.VERIFY_SSL_CERT = False
 
         store = kwargs.get('store')
-        self.store = store or self._get_provisioner_store()
+        self.proc_name = self.CFG.provisioner.get('proc_name', "")
+        self.store = store or get_provisioner_store(self.CFG, proc_name=self.proc_name)
         self.store.initialize()
 
         notifier = kwargs.get('notifier')
-        self.notifier = notifier or ProvisionerNotifier(self)
+        epum_topic = self.CFG.provisioner.epu_management_service_name
+        self.notifier = notifier or ProvisionerNotifier(self, [epum_topic])
 
         amqp_uri = kwargs.get('amqp_uri')
         self.amqp_uri = amqp_uri
 
         self.topic = self.CFG.provisioner.get('service_name')
 
-        self.dashi = bootstrap.dashi_connect(self.topic, self.CFG, self.amqp_uri)
+        self.sysname = kwargs.get('sysname')
+
+        self.dashi = bootstrap.dashi_connect(self.topic, self.CFG, self.amqp_uri, self.sysname)
+
+        statsd_cfg = kwargs.get('statsd')
+        statsd_cfg = statsd_cfg or self.CFG.get('statsd')
 
         dtrs = kwargs.get('dtrs')
         dtrs_topic = self.CFG.provisioner.dtrs_service_name
-        self.dtrs = dtrs or self._get_dtrs(dtrs_topic)
+        self.dtrs = dtrs or self._get_dtrs(dtrs_topic, statsd_cfg=statsd_cfg, client_name=self.topic)
 
         contextualization_disabled = kwargs.get('contextualization_disabled')
         if contextualization_disabled is None:
@@ -58,17 +74,32 @@ class ProvisionerService(object):
         default_user = kwargs.get('default_user')
         self.default_user = default_user or self.CFG.provisioner.get('default_user')
 
+        iaas_timeout = kwargs.get('iaas_timeout')
+        iaas_timeout = iaas_timeout or self.CFG.provisioner.get('iaas_timeout')
+
+        instance_ready_timeout = kwargs.get('instance_ready_timeout')
+        instance_ready_timeout = instance_ready_timeout or self.CFG.provisioner.get('instance_ready_timeout')
+
+        record_reaping_max_age = kwargs.get('record_reaping_max_age')
+        record_reaping_max_age = record_reaping_max_age or self.CFG.provisioner.get('record_reaping_max_age')
+
         core = kwargs.get('core')
         core = core or self._get_core()
 
-        self.core = core(self.store, self.notifier, self.dtrs, context_client)
+        self.core = core(self.store, self.notifier, self.dtrs, context_client,
+                iaas_timeout=iaas_timeout, statsd_cfg=statsd_cfg, instance_ready_timeout=instance_ready_timeout)
 
         leader = kwargs.get('leader')
-        self.leader = leader or ProvisionerLeader(self.store, self.core)
+        self.leader = leader or ProvisionerLeader(self.store, self.core,
+                                                  record_reaping_max_age=record_reaping_max_age)
+
+        self.ready_event = threading.Event()
 
     def start(self):
 
         log.info("starting provisioner instance %s" % self)
+
+        epu.dashiproc.link_dashi_exceptions(self.dashi)
 
         # Set up operations
         self.dashi.handle(self.provision)
@@ -80,14 +111,20 @@ class ProvisionerService(object):
 
         self.leader.initialize()
 
+        self.ready_event.set()
+
         try:
             self.dashi.consume()
         except KeyboardInterrupt:
-            log.warning("Caught terminate signal. Bye!")
+            log.warning("Provisioner caught terminate signal. Bye!")
         else:
-            log.info("Exiting normally. Bye!")
-        finally:
-            self.leader.depose()
+            log.info("Provisioner exiting normally. Bye!")
+
+    def stop(self):
+        self.ready_event.clear()
+        self.dashi.cancel()
+        self.dashi.disconnect()
+        self.store.shutdown()
 
     @property
     def default_user(self):
@@ -97,12 +134,11 @@ class ProvisionerService(object):
         else:
             return self._default_user
 
-    @default_user.setter
+    @default_user.setter  # noqa
     def default_user(self, default_user):
         self._default_user = default_user
 
-
-    def provision(self, launch_id, deployable_type, instance_ids, subscribers,
+    def provision(self, launch_id, deployable_type, instance_ids,
                   site, allocation=None, vars=None, caller=None):
         """Service operation: provision new VM instances
 
@@ -112,7 +148,6 @@ class ProvisionerService(object):
         @param launch_id: unique launch ID
         @param deployable_type: name of the deployable type to provision
         @param instance_ids: sequence of unique instance IDs
-        @param subscribers: sequence of subscribers to send state updates to
         @param site: IaaS site to deploy instance to
         @param allocation: IaaS allocation to request
         @param vars: dictionary of key/value pairs to be fed to deployable type
@@ -123,10 +158,10 @@ class ProvisionerService(object):
         caller = caller or self.default_user
 
         launch, nodes = self.core.prepare_provision(launch_id, deployable_type,
-            instance_ids, subscribers, site, allocation, vars, caller)
+            instance_ids, site, allocation, vars, caller=caller)
 
         if launch['state'] < InstanceState.FAILED:
-            self.core.execute_provision(launch, nodes, caller)
+            self.core.execute_provision(launch, nodes, caller=caller)
         else:
             log.warn("Launch %s couldn't be prepared, not executing",
                 launch['launch_id'])
@@ -178,26 +213,13 @@ class ProvisionerService(object):
         caller = caller or self.default_user
         return self.core.describe_nodes(nodes, caller)
 
-    def dump_state(self, nodes=None, force_subscribe=False):
+    def dump_state(self, nodes=None):
         """Service operation: (re)send state information to subscribers
         """
         if not nodes:
             log.error("Got dump_state request without a nodes list")
         else:
-            self.core.dump_state(nodes, force_subscribe=force_subscribe)
-
-    def _get_provisioner_store(self):
-
-        zookeeper = self.CFG.get("zookeeper")
-        if zookeeper:
-            log.info("Using ZooKeeper Provisioner store")
-            store = ProvisionerZooKeeperStore(zookeeper['hosts'],
-                zookeeper['provisioner_path'], username=zookeeper.get('username'),
-                password=zookeeper.get('password'), timeout=zookeeper.get('timeout'))
-        else:
-            log.info("Using in-memory Provisioner store")
-            store = ProvisionerStore()
-        return store
+            self.core.dump_state(nodes)
 
     def _get_context_client(self):
         if not self.CFG.get('context'):
@@ -207,7 +229,7 @@ class ProvisionerService(object):
             return ProvisionerContextClient(self.CFG.context.uri,
                                             self.CFG.context.key,
                                             self.CFG.context.secret)
-        except AttributeError,e:
+        except AttributeError, e:
             raise AttributeError("Provisioner config missing: " + str(e))
 
     def _get_core(self):
@@ -220,35 +242,61 @@ class ProvisionerService(object):
         core = get_class(core_name)
         return core
 
-    def _get_dtrs(self, dtrs_topic):
+    def _get_dtrs(self, dtrs_topic, statsd_cfg=None, client_name=None):
 
-        dtrs = DTRSClient(self.dashi, topic=dtrs_topic)
+        dtrs = DTRSClient(self.dashi, topic=dtrs_topic, statsd_cfg=statsd_cfg, client_name=client_name)
         return dtrs
+
+
+def statsd(func):
+    def call(provisioner_client, *args, **kwargs):
+        before = time.time()
+        ret = func(provisioner_client, *args, **kwargs)
+        after = time.time()
+        if provisioner_client.statsd_client is not None:
+            try:
+                client_name = provisioner_client.client_name or "provisioner_client"
+                provisioner_client.statsd_client.timing(
+                    '%s.%s.timing' % (client_name, func.__name__), (after - before) * 1000)
+                provisioner_client.statsd_client.incr('%s.%s.count' % (client_name, func.__name__))
+            except:
+                log.exception("Failed to submit metrics")
+        return ret
+    return call
 
 
 class ProvisionerClient(object):
 
-    def __init__(self, dashi, handle_instance_state=True, topic=None):
-
+    def __init__(self, dashi, topic=None, statsd_cfg=None, client_name=None):
         self.dashi = dashi
         self.topic = topic or "provisioner"
+        self.client_name = client_name
+        self.statsd_client = None
+        if statsd_cfg is not None:
+            try:
+                host = statsd_cfg["host"]
+                port = statsd_cfg["port"]
+                log.info("Setting up statsd client with host %s and port %d" % (host, port))
+                self.statsd_client = StatsClient(host, port)
+            except:
+                log.exception("Failed to set up statsd client")
 
-        if handle_instance_state:
-            self.dashi.handle(self.instance_state)
-
+    @statsd
     def terminate_nodes(self, nodes, caller=None):
         """Service operation: Terminate one or more nodes
         """
-        log.debug('op_terminate_nodes nodes:'+str(nodes))
+        log.debug("op_terminate_nodes nodes:" + str(nodes))
         self.dashi.fire(self.topic, "terminate_nodes", nodes=nodes, caller=caller)
 
+    @statsd
     def terminate_all(self, rpcwait=True):
         if rpcwait:
             return self.dashi.call(self.topic, "terminate_all")
         else:
             self.dashi.fire(self.topic, "terminate_all")
 
-    def provision(self, launch_id, instance_ids, deployable_type, subscribers,
+    @statsd
+    def provision(self, launch_id, instance_ids, deployable_type,
                   site=None, allocation=None, vars=None, **extras):
         """Provisions a deployable type
         """
@@ -257,13 +305,14 @@ class ProvisionerClient(object):
 
         self.dashi.fire(self.topic, "provision", launch_id=launch_id,
             deployable_type=deployable_type, instance_ids=instance_ids,
-            subscribers=subscribers, site=site, allocation=allocation,
-            vars=vars, **extras)
+            site=site, allocation=allocation, vars=vars, **extras)
 
+    @statsd
     def dump_state(self, nodes=None, force_subscribe=None):
-        log.debug('Sending dump_state request to provisioner')
-        self.dashi.fire(self.topic, 'dump_state', nodes=nodes, force_subscribe=force_subscribe)
+        log.debug("Sending dump_state request to provisioner")
+        self.dashi.fire(self.topic, 'dump_state', nodes=nodes)
 
+    @statsd
     def describe_nodes(self, nodes=None, caller=None):
         """Query state records for nodes managed by the provisioner
 
@@ -272,20 +321,20 @@ class ProvisionerClient(object):
         """
         return self.dashi.call(self.topic, 'describe_nodes', nodes=nodes, caller=caller)
 
+    @statsd
     def enable(self):
         self.dashi.call(self.topic, 'enable')
-
-    def instance_state(self, record):
-        log.info("Got instance state: %s" % record)
 
 
 class ProvisionerNotifier(object):
     """Abstraction for sending node updates to subscribers.
     """
-    def __init__(self, process):
+    def __init__(self, process, subscribers, operation='instance_info'):
         self.process = process
+        self.subscribers = list(subscribers)
+        self.operation = operation
 
-    def send_record(self, record, subscribers, operation='instance_info'):
+    def send_record(self, record):
         """Send a single node record to all subscribers.
         """
         record = record.copy()
@@ -294,18 +343,21 @@ class ProvisionerNotifier(object):
         # strip this off before we send it out to subscribers.
         sanitize_record(record)
 
-        log.debug('Sending state %s record for node %s to %s',
+        subscribers = self.subscribers
+        log.debug("Sending state %s record for node %s to %s",
                 record['state'], record['node_id'], repr(subscribers))
         if subscribers:
             for sub in subscribers:
-                self.process.dashi.fire(sub, operation, record=record)
+                self.process.dashi.fire(sub, self.operation, record=record)
 
-    def send_records(self, records, subscribers, operation='instance_info'):
+    def send_records(self, records):
         """Send a set of node records to all subscribers.
         """
         for rec in records:
-            self.send_record(rec, subscribers, operation)
+            self.send_record(rec)
+
 
 def main():
+    epu.dashiproc.epu_register_signal_stack_debug()
     provisioner = ProvisionerService()
     provisioner.start()

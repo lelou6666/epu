@@ -1,8 +1,11 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import threading
 
 g_threadlocal = threading.local()
 g_context_log_fields = ["domain", "user", "request_id"]
+
 
 class DomainLogAdapter(logging.LoggerAdapter):
 
@@ -23,6 +26,7 @@ class DomainLogAdapter(logging.LoggerAdapter):
             extra[f] = v
         return msg, kwargs
 
+
 class DomainLogFilter(logging.Filter):
     """
     This log filter adds the defined fields for the epu logs.  It does not actually filter any log records out,
@@ -37,7 +41,7 @@ class DomainLogFilter(logging.Filter):
 
         # set any value needed
         domain_info = ""
-        for f in g_context_log_fields: 
+        for f in g_context_log_fields:
             kw = g_threadlocal.epu_info[-1]
             if f in kw:
                 domain_info = "%s %s=%s" % (domain_info, f, kw[f])
@@ -58,6 +62,3 @@ class EpuLoggerThreadSpecific():
     def __exit__(self, type, value, traceback):
         g_threadlocal.epu_info.pop()
         return None
-
-
-
