@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import uuid
 from socket import timeout
@@ -80,14 +82,15 @@ class HighAvailabilityService(object):
         self.topic = kwargs.get('service_name') or self.CFG.highavailability.get('service_name') or DEFAULT_TOPIC
 
         self.amqp_uri = kwargs.get('amqp_uri') or None
-        self.dashi = bootstrap.dashi_connect(self.topic, self.CFG, self.amqp_uri)
+        self.dashi = bootstrap.dashi_connect(self.topic, self.CFG, self.amqp_uri, sysname=kwargs.get('sysname'))
 
         process_dispatchers = (kwargs.get('process_dispatchers') or
                 self.CFG.highavailability.processdispatchers)
 
         policy_name = self.CFG.highavailability.policy.name
         try:
-            self.policy = policy_map[policy_name.lower()]
+            policy_map[policy_name.lower()]
+            self.policy = policy_name.lower()
         except KeyError:
             raise Exception("HA Service doesn't support '%s' policy" % policy_name)
 
@@ -162,7 +165,6 @@ class HighAvailabilityServiceClient(object):
     def reconfigure_policy(self, new_policy):
         """Service operation: Change policy
         """
-        log.debug('reconfigure_policy: %s' % new_policy)
         self.dashi.call(self.topic, "reconfigure_policy", new_policy=new_policy)
 
     def status(self):

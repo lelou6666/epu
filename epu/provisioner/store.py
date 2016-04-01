@@ -1,4 +1,5 @@
-#!/usr/bin/env python
+# Copyright 2013 University of Chicago
+
 
 """
 @file epu/provisioner/store.py
@@ -37,7 +38,7 @@ def get_provisioner_store(config, use_gevent=False, proc_name=None):
         store = ProvisionerZooKeeperStore(zookeeper['hosts'],
             zookeeper['path'], username=zookeeper.get('username'),
             password=zookeeper.get('password'), timeout=zookeeper.get('timeout'),
-            proc_name=proc_name)
+            proc_name=proc_name, use_gevent=use_gevent)
 
     else:
         log.info("Using in-memory Provisioner store")
@@ -64,6 +65,14 @@ class ProvisionerStore(object):
 
     def initialize(self):
         pass
+
+    def shutdown(self):
+        # In-memory store, only stop the leaders
+        try:
+            if self.is_leading:
+                self._break_leader()
+        except Exception, e:
+            log.exception("Error cancelling leader: %s", e)
 
     def is_disabled(self):
         """Indicates that the Provisioner is in disabled mode, which means
@@ -351,7 +360,7 @@ class ProvisionerZooKeeperStore(object):
                  timeout=None, use_gevent=False, proc_name=None):
 
         kwargs = zkutil.get_kazoo_kwargs(username=username, password=password,
-            timeout=timeout, use_gevent=use_gevent)
+                                         timeout=timeout, use_gevent=use_gevent)
         self.kazoo = KazooClient(hosts + base_path, **kwargs)
 
         self.retry = zkutil.get_kazoo_retry()
@@ -367,10 +376,11 @@ class ProvisionerZooKeeperStore(object):
         #  callback fired when the connection state changes
         self.kazoo.add_listener(self._connection_state_listener)
 
+        self._shutdown = False
+
         self._election_enabled = False
         self._election_condition = threading.Condition()
         self._election_thread = None
-        self._election_thread_running = False
 
         self._leader = None
 
@@ -378,16 +388,17 @@ class ProvisionerZooKeeperStore(object):
         self._disabled_condition = threading.Condition()
 
     def initialize(self):
-
+        self._shutdown = False
         self.kazoo.start()
 
         for path in (self.LAUNCH_PATH, self.NODE_PATH, self.TERMINATING_PATH):
             self.kazoo.ensure_path(path)
 
     def shutdown(self):
-        # depose the leader and cancel the election just in case
-        self.election.cancel()
-        self._election_thread_running = False
+        with self._election_condition:
+            self._shutdown = True
+            self._election_enabled = False
+            self._election_condition.notify_all()
 
         try:
             if self._leader:
@@ -395,9 +406,15 @@ class ProvisionerZooKeeperStore(object):
         except Exception, e:
             log.exception("Error deposing leader: %s", e)
 
+        self.election.cancel()
+
         if self._election_thread:
             self._election_thread.join()
         self.kazoo.stop()
+        try:
+            self.kazoo.close()
+        except Exception:
+            log.exception("Problem cleaning up kazoo")
 
     def _connection_state_listener(self, state):
         # called by kazoo when the connection state changes.
@@ -407,6 +424,7 @@ class ProvisionerZooKeeperStore(object):
     def _handle_connection_state(self, state):
 
         if state in (KazooState.LOST, KazooState.SUSPENDED):
+            log.debug("disabling election and leader")
             with self._election_condition:
                 self._election_enabled = False
                 self._election_condition.notify_all()
@@ -421,6 +439,7 @@ class ProvisionerZooKeeperStore(object):
             self.election.cancel()
 
         elif state == KazooState.CONNECTED:
+            log.debug("enabling election")
             with self._election_condition:
                 self._election_enabled = True
                 self._election_condition.notify_all()
@@ -435,7 +454,7 @@ class ProvisionerZooKeeperStore(object):
 
             # check if the node exists and set up a callback
             exists = self.retry(self.kazoo.exists, self.DISABLED_PATH,
-                self._disabled_watch)
+                                self._disabled_watch)
             if exists:
                 if not self._disabled:
                     log.warn("Detected provisioner DISABLED state began")
@@ -491,21 +510,28 @@ class ProvisionerZooKeeperStore(object):
         """
         assert self._leader is None
         self._leader = leader
-        self._election_thread = tevent.spawn(self._run_election)
+        self._election_thread = tevent.spawn(self._run_election,
+                                             self.election, leader, "leader")
 
-    def _run_election(self):
+    def _run_election(self, election, leader, name):
         """Election thread function
         """
-        self._election_thread_running = True
-        while self._election_thread_running:
+        while True:
             with self._election_condition:
-                try:
-                    self.election.run(self._leader.inaugurate)
-                except Exception, e:
-                    log.exception("Error in leader election: %s", e)
-
                 while not self._election_enabled:
+                    if self._shutdown:
+                        return
+                    log.debug("%s election waiting for to be enabled", name)
                     self._election_condition.wait()
+                if self._shutdown:
+                    return
+            try:
+                election.run(leader.inaugurate)
+            except Exception, e:
+                log.exception("Error in %s election: %s", name, e)
+            except:
+                log.exception("Unhandled error in election")
+                raise
 
     #########################################################################
     # LAUNCHES

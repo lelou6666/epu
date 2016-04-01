@@ -1,13 +1,15 @@
+# Copyright 2013 University of Chicago
+
 import uuid
 import unittest
 import logging
 
-from kazoo.exceptions import ConnectionLoss
+from kazoo.exceptions import KazooException
 
 from epu.decisionengine.impls.simplest import CONF_PRESERVE_N
 from epu.epumanagement.core import CoreInstance
 from epu.epumanagement.store import LocalEPUMStore, ZooKeeperEPUMStore
-from epu.epumanagement.conf import *
+from epu.epumanagement.conf import *  # noqa
 from epu.exceptions import WriteConflictError
 from epu.test import ZooKeeperTestMixin, SocatProxyRestartWrapper
 
@@ -97,17 +99,17 @@ class BaseEPUMStoreTests(unittest.TestCase):
 
         general_out = domain.get_general_config()
         self.assertTrue(isinstance(general_out, dict))
-        self.assertTrue(general_out.has_key(EPUM_CONF_ENGINE_CLASS))
+        self.assertTrue(EPUM_CONF_ENGINE_CLASS in general_out)
         self.assertEqual(engine_class, general_out[EPUM_CONF_ENGINE_CLASS])
 
         engine_out = domain.get_engine_config()
         self.assertTrue(isinstance(engine_out, dict))
-        self.assertTrue(engine_out.has_key(CONF_PRESERVE_N))
+        self.assertTrue(CONF_PRESERVE_N in engine_out)
         self.assertEqual(2, engine_out[CONF_PRESERVE_N])
 
         health_out = domain.get_health_config()
         self.assertTrue(isinstance(health_out, dict))
-        self.assertTrue(health_out.has_key(EPUM_CONF_HEALTH_MONITOR))
+        self.assertTrue(EPUM_CONF_HEALTH_MONITOR in health_out)
         self.assertEqual(False, health_out[EPUM_CONF_HEALTH_MONITOR])
         health_enabled = domain.is_health_enabled()
         self.assertFalse(health_enabled)
@@ -219,6 +221,8 @@ class EPUMZooKeeperStoreTests(BaseEPUMStoreTests, ZooKeeperTestMixin):
         self.store.initialize()
 
     def tearDown(self):
+        if self.store:
+            self.store.shutdown()
         self.teardown_zookeeper()
 
 
@@ -250,4 +254,4 @@ class EPUMZooKeeperStoreProxyKillsTests(BaseEPUMStoreTests, ZooKeeperTestMixin):
             self.store.kazoo.get("/")
         self.real_store.fake_operation = fake_operation
 
-        self.assertRaises(ConnectionLoss, self.store.fake_operation)
+        self.assertRaises(KazooException, self.store.fake_operation)

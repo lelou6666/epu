@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 #!/usr/bin/env python
 
 """
@@ -11,7 +13,7 @@ import logging
 import unittest
 import threading
 
-from kazoo.exceptions import ConnectionLoss
+from kazoo.exceptions import KazooException
 
 from epu.provisioner.store import ProvisionerStore, ProvisionerZooKeeperStore,\
     group_records
@@ -94,19 +96,19 @@ class BaseProvisionerStoreTests(unittest.TestCase):
         self.assertEqual(launch_id_2, requested[0]['launch_id'])
 
         requested = self.store.get_launches(
-                min_state=states.REQUESTED,
-                max_state=states.REQUESTED)
+            min_state=states.REQUESTED,
+            max_state=states.REQUESTED)
         self.assertEqual(1, len(requested))
         self.assertEqual(launch_id_2, requested[0]['launch_id'])
 
         at_least_requested = self.store.get_launches(
-                min_state=states.REQUESTED)
+            min_state=states.REQUESTED)
         self.assertEqual(2, len(at_least_requested))
         for l in at_least_requested:
             self.assertTrue(l['launch_id'] in (launch_id_1, launch_id_2))
 
         at_least_pending = self.store.get_launches(
-                min_state=states.PENDING)
+            min_state=states.PENDING)
         self.assertEqual(1, len(at_least_pending))
         self.assertEqual(at_least_pending[0]['launch_id'], launch_id_1)
 
@@ -291,18 +293,17 @@ class ProvisionerZooKeeperStoreProxyKillTests(BaseProvisionerStoreTests, ZooKeep
             self.store.kazoo.get("/")
         self.real_store.fake_operation = fake_operation
 
-        self.assertRaises(ConnectionLoss, self.store.fake_operation)
-
+        self.assertRaises(KazooException, self.store.fake_operation)
 
 
 class GroupRecordsTests(unittest.TestCase):
 
     def test_group_records(self):
         records = [
-                {'site': 'chicago', 'allocation': 'big', 'name': 'sandwich'},
-                {'name':'pizza', 'allocation': 'big', 'site': 'knoxville'},
-                {'name':'burrito', 'allocation': 'small', 'site': 'chicago'}
-                ]
+            {'site': 'chicago', 'allocation': 'big', 'name': 'sandwich'},
+            {'name': 'pizza', 'allocation': 'big', 'site': 'knoxville'},
+            {'name': 'burrito', 'allocation': 'small', 'site': 'chicago'}
+        ]
 
         groups = group_records(records, 'site')
         self.assertEqual(len(groups.keys()), 2)

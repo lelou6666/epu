@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import unittest
 from collections import defaultdict
@@ -7,14 +9,15 @@ import uuid
 import threading
 from socket import timeout
 
-
+from mock import patch
 from dashi import bootstrap, DashiConnection
 
 import epu.tevent as tevent
 from epu.dashiproc.processdispatcher import ProcessDispatcherService, \
     ProcessDispatcherClient, SubscriberNotifier
 from epu.processdispatcher.test.mocks import FakeEEAgent, MockEPUMClient, \
-    MockNotifier, get_definition, get_domain_config, nosystemrestart_process_config
+    MockNotifier, get_definition, get_domain_config, nosystemrestart_process_config, \
+    minimum_time_between_starts_config
 from epu.processdispatcher.engines import EngineRegistry, domain_id_from_engine
 from epu.states import InstanceState, ProcessState
 from epu.processdispatcher.store import ProcessRecord, ProcessDispatcherStore, ProcessDispatcherZooKeeperStore
@@ -30,7 +33,13 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
 
     amqp_uri = "amqp://guest:guest@127.0.0.1//"
 
-    engine_conf = {'engine1': {'slots': 4, 'base_need': 1}, 'engine2': {'slots': 4}}
+    engine_conf = {'engine1': {'slots': 4, 'base_need': 1},
+                   'engine2': {'slots': 4}, 'engine3': {'slots': 4},
+                   'engine4': {
+                       'slots': 4, 'heartbeat_warning': 10, 'heartbeat_missing': 20,
+                       'heartbeat_period': 1, 'base_need': 1}}
+    default_engine = 'engine1'
+    process_engines = {'a.b.C': 'engine3', 'a.b': 'engine2'}
 
     def setUp(self):
 
@@ -42,8 +51,9 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
 
         self.store = self.setup_store()
 
+        self.sysname = "test-sysname%s" % uuid.uuid4().hex
+
         self.start_pd()
-        self.sysname = self.pd.dashi.sysname
         self.client = ProcessDispatcherClient(self.pd.dashi, self.pd_name)
 
         def waiter():
@@ -69,17 +79,19 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
         self._kill_all_eeagents()
 
     def start_pd(self):
-        self.registry = EngineRegistry.from_config(self.engine_conf, default='engine1')
+        self.registry = EngineRegistry.from_config(self.engine_conf,
+            default=self.default_engine, process_engines=self.process_engines)
         self.notifier = MockNotifier()
 
         self.pd = ProcessDispatcherService(amqp_uri=self.amqp_uri,
             registry=self.registry, epum_client=self.epum_client,
             notifier=self.notifier, definition_id=self.definition_id,
-            domain_config=get_domain_config(), store=self.store)
+            domain_config=get_domain_config(), store=self.store,
+            sysname=self.sysname)
 
         self.pd_name = self.pd.topic
         self.pd_thread = tevent.spawn(self.pd.start)
-        time.sleep(0.05)
+        self.pd.ready_event.wait(60)
 
     def stop_pd(self):
         self.pd.stop()
@@ -99,10 +111,10 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
         dashi = bootstrap.dashi_connect(agent_name, sysname=self.sysname,
                                         amqp_uri=self.amqp_uri)
 
-        agent = FakeEEAgent(dashi, heartbeat_dest, node_id, slot_count)
+        agent = FakeEEAgent(agent_name, dashi, heartbeat_dest, node_id, slot_count)
         self.eeagents[agent_name] = agent
         self.eeagent_threads[agent_name] = tevent.spawn(agent.start)
-        time.sleep(0.1)  # hack to hopefully ensure consumer is bound TODO??
+        agent.ready_event.wait(10)
 
         agent.send_heartbeat()
         return agent
@@ -132,6 +144,22 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
         log.debug("PD state: %s", state)
         fun(state, *args, **kwargs)
 
+    def assert_one_reconfigure(self, domain_id=None, preserve_n=None, retirees=None):
+        if domain_id is not None:
+            reconfigures = self.epum_client.reconfigures[domain_id]
+        else:
+            reconfigures = self.epum_client.reconfigures.values()
+            self.assertTrue(reconfigures)
+            reconfigures = reconfigures[0]
+        self.assertEqual(len(reconfigures), 1)
+        reconfigure = reconfigures[0]
+        engine_conf = reconfigure['engine_conf']
+        if preserve_n is not None:
+            self.assertEqual(engine_conf['preserve_n'], preserve_n)
+        if retirees is not None:
+            retirables = engine_conf.get('retirable_nodes', [])
+            self.assertEqual(set(retirables), set(retirees))
+
     max_tries = 10
 
     def _wait_assert_pd_dump(self, fun, *args, **kwargs):
@@ -143,6 +171,28 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
                 tries += 1
                 if tries == self.max_tries:
                     log.error("PD state assertion failing after %d attempts",
+                              tries)
+                    raise
+            else:
+                return
+            time.sleep(0.05)
+
+    def _wait_for_one_reconfigure(self, domain_id=None,):
+        tries = 0
+        while True:
+            if domain_id is not None:
+                reconfigures = self.epum_client.reconfigures[domain_id]
+            else:
+                reconfigures = self.epum_client.reconfigures.values()
+                self.assertTrue(reconfigures)
+                reconfigures = reconfigures[0]
+
+            try:
+                self.assertEqual(len(reconfigures), 1)
+            except Exception:
+                tries += 1
+                if tries == self.max_tries:
+                    log.error("Waiting for reconfigure failing after %d attempts",
                               tries)
                     raise
             else:
@@ -212,6 +262,54 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
         self._wait_assert_pd_dump(assert_process_rounds)
         self._wait_assert_pd_dump(self._assert_process_distribution,
                                   agent_counts=[processes_left])
+
+    def test_terminate_when_waiting(self):
+        """test_terminate_when_waiting
+        submit a proc, wait for it to get to a waiting state, epum
+        should then be configured to scale up, then terminate it.
+        EPUM should be reconfigured to scale down at that point.
+        """
+
+        domain_id = domain_id_from_engine("engine2")
+        self._wait_for_one_reconfigure(domain_id)
+        self.assert_one_reconfigure(domain_id, 0, [])
+        self.epum_client.clear()
+
+        procs = ["proc1", "proc2", "proc3"]
+        for proc in procs:
+            procstate = self.client.schedule_process(proc,
+                self.process_definition_id, None, restart_mode=RestartMode.NEVER,
+                execution_engine_id="engine2")
+            self.assertEqual(procstate['upid'], proc)
+
+        self._wait_assert_pd_dump(self._assert_process_distribution,
+                                  queued=procs)
+
+        self._wait_for_one_reconfigure(domain_id)
+        self.assert_one_reconfigure(domain_id, 1, [])
+        self.epum_client.clear()
+
+        # now terminate one process. Shouldn't have any reconfigs
+        todie = procs.pop()
+        procstate = self.client.terminate_process(todie)
+        self.assertEqual(procstate['upid'], todie)
+
+        self._wait_assert_pd_dump(self._assert_process_distribution,
+                                        queued=procs)
+
+        self.assertEqual(self.epum_client.reconfigures, {})
+
+        # now kill the remaining procs. we should see a scale down
+        for todie in procs:
+            procstate = self.client.terminate_process(todie)
+            self.assertEqual(procstate['upid'], todie)
+
+        self._wait_assert_pd_dump(self._assert_process_distribution,
+                                        queued=[])
+
+        self._wait_for_one_reconfigure(domain_id)
+        self.assert_one_reconfigure(domain_id, 0, [])
+        self.epum_client.clear()
 
     def test_multiple_ee_per_node(self):
 
@@ -381,6 +479,49 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
             InstanceState.RUNNING)
         self._spawn_eeagent("node3", 4)
         self.notifier.wait_for_state('p5', ProcessState.RUNNING)
+
+    def test_process_engine_map(self):
+        def1 = uuid.uuid4().hex
+        self.client.create_definition(def1, "dtype",
+            executable={"module": "a.b", "class": "C"},
+            name="my_process")
+        def2 = uuid.uuid4().hex
+        self.client.create_definition(def2, "dtype",
+            executable={"module": "a.b", "class": "D"},
+            name="my_process")
+        def3 = uuid.uuid4().hex
+        self.client.create_definition(def3, "dtype",
+            executable={"module": "a", "class": "B"},
+            name="my_process")
+
+        self.client.node_state("node1", domain_id_from_engine("engine1"),
+            InstanceState.RUNNING)
+        eeagent1 = self._spawn_eeagent("node1", 4)
+
+        self.client.node_state("node2", domain_id_from_engine("engine2"),
+            InstanceState.RUNNING)
+        eeagent2 = self._spawn_eeagent("node2", 4)
+
+        self.client.node_state("node3", domain_id_from_engine("engine3"),
+            InstanceState.RUNNING)
+        eeagent3 = self._spawn_eeagent("node3", 4)
+
+        self.client.schedule_process("proc1", def1)
+        self.client.schedule_process("proc2", def2)
+        self.client.schedule_process("proc3", def3)
+
+        self.notifier.wait_for_state("proc1", ProcessState.RUNNING)
+        self.notifier.wait_for_state("proc2", ProcessState.RUNNING)
+        self.notifier.wait_for_state("proc3", ProcessState.RUNNING)
+
+        proc1 = self.client.describe_process("proc1")
+        self.assertEqual(proc1['assigned'], eeagent3.name)
+
+        proc2 = self.client.describe_process("proc2")
+        self.assertEqual(proc2['assigned'], eeagent2.name)
+
+        proc3 = self.client.describe_process("proc3")
+        self.assertEqual(proc3['assigned'], eeagent1.name)
 
     def test_node_exclusive(self):
         node = "node1"
@@ -629,7 +770,7 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
                 ProcessState.RUNNING, ["proc3"])
 
     def test_queueing(self):
-        #submit some processes before there are any resources available
+        # submit some processes before there are any resources available
 
         procs = ["proc1", "proc2", "proc3", "proc4", "proc5"]
         for proc in procs:
@@ -724,11 +865,11 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
                                      agents=None, agent_counts=None,
                                      queued=None, queued_count=None,
                                      rejected=None, rejected_count=None):
-        #Assert the distribution of processes among nodes
-        #node and agent counts are given as sequences of integers which are not
-        #specific to a named node. So specifying node_counts=[4,3] will match
-        #as long as you have 4 processes assigned to one node and 3 to another,
-        #regardless of the node name
+        # Assert the distribution of processes among nodes
+        # node and agent counts are given as sequences of integers which are not
+        # specific to a named node. So specifying node_counts=[4,3] will match
+        # as long as you have 4 processes assigned to one node and 3 to another,
+        # regardless of the node name
         found_rejected = set()
         found_queued = set()
         found_node = defaultdict(set)
@@ -772,7 +913,7 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
             assigned_lengths = [len(s) for s in found_assigned.itervalues()]
             # omit zero counts
             agent_counts = [count for count in agent_counts if count != 0]
-            #print "%s =?= %s" % (agent_counts, assigned_lengths)
+            # print "%s =?= %s" % (agent_counts, assigned_lengths)
             self.assertEqual(sorted(assigned_lengths), sorted(agent_counts))
 
         if nodes is not None:
@@ -995,14 +1136,6 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
         self._wait_assert_pd_dump(self._assert_process_states,
                 ProcessState.FAILED, ["proc1"])
 
-        reached_running = False
-        try:
-            self.notifier.wait_for_state("proc1", ProcessState.RUNNING)
-            reached_running = True
-        except Exception:
-            pass
-        assert not reached_running
-
     def test_restart_mode_always(self):
 
         constraints = dict(hat_type="fedora")
@@ -1022,7 +1155,7 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
 
         self.client.schedule_process("proc2", self.process_definition_id,
             constraints=constraints, queueing_mode=proc2_queueing_mode,
-            restart_mode=proc2_restart_mode)
+            restart_mode=proc2_restart_mode, configuration={'process': {'minimum_time_between_starts': 0.1}})
 
         self.notifier.wait_for_state("proc2", ProcessState.RUNNING)
         self._wait_assert_pd_dump(self._assert_process_states,
@@ -1106,14 +1239,6 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
         self._wait_assert_pd_dump(self._assert_process_states,
                 ProcessState.EXITED, ["proc1"])
 
-        reached_running = False
-        try:
-            self.notifier.wait_for_state("proc1", ProcessState.RUNNING)
-            reached_running = True
-        except:
-            pass
-        assert not reached_running
-
     def test_start_count(self):
 
         nodes = ['node1']
@@ -1143,6 +1268,83 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
                                         nodes=dict(node1=["proc1"]))
         proc = self.store.get_process(None, "proc1")
         self.assertEqual(proc.starts, 2)
+
+    def test_minimum_time_between_starts(self):
+
+        constraints = dict(hat_type="fedora")
+
+        # Start a node
+        node = "node1"
+        domain_id = domain_id_from_engine('engine1')
+        node_properties = dict(hat_type="fedora")
+        self.client.node_state(node, domain_id, InstanceState.RUNNING,
+                node_properties)
+        eeagent = self._spawn_eeagent(node, 4)
+
+        # Test RestartMode.ALWAYS
+        queueing_mode = QueueingMode.ALWAYS
+        restart_mode = RestartMode.ALWAYS
+
+        default_time_to_throttle = 2
+        time_to_throttle = 10
+
+        self.client.schedule_process("proc1", self.process_definition_id,
+            constraints=constraints, queueing_mode=queueing_mode,
+            restart_mode=restart_mode)
+
+        self.client.schedule_process("proc2", self.process_definition_id,
+            constraints=constraints, queueing_mode=queueing_mode,
+            restart_mode=restart_mode,
+            configuration=minimum_time_between_starts_config(time_to_throttle))
+
+        # Processes should start once without delay
+        self.notifier.wait_for_state("proc1", ProcessState.RUNNING)
+        self._wait_assert_pd_dump(self._assert_process_states,
+                ProcessState.RUNNING, ["proc1"])
+
+        self.notifier.wait_for_state("proc2", ProcessState.RUNNING)
+        self._wait_assert_pd_dump(self._assert_process_states,
+                ProcessState.RUNNING, ["proc2"])
+
+        # Processes should be restarted once without delay
+        eeagent.exit_process("proc1")
+        eeagent.exit_process("proc2")
+
+        self.notifier.wait_for_state("proc1", ProcessState.RUNNING)
+        self._wait_assert_pd_dump(self._assert_process_states,
+                ProcessState.RUNNING, ["proc1"])
+        self.notifier.wait_for_state("proc2", ProcessState.RUNNING)
+        self._wait_assert_pd_dump(self._assert_process_states,
+                ProcessState.RUNNING, ["proc2"])
+
+        # The second time proc1 should be throttled for 2s (the default), and
+        # proc2 should be throttled for the configured 5s
+        eeagent.exit_process("proc1")
+        eeagent.exit_process("proc2")
+
+        self.notifier.wait_for_state("proc1", ProcessState.WAITING)
+        self._wait_assert_pd_dump(self._assert_process_states,
+                ProcessState.WAITING, ["proc1"])
+        self.notifier.wait_for_state("proc2", ProcessState.WAITING)
+        self._wait_assert_pd_dump(self._assert_process_states,
+                ProcessState.WAITING, ["proc2"])
+
+        # After waiting a few seconds, proc1 should be restarted
+        time.sleep(default_time_to_throttle + 1)
+
+        self.notifier.wait_for_state("proc1", ProcessState.RUNNING)
+        self._wait_assert_pd_dump(self._assert_process_states,
+                ProcessState.RUNNING, ["proc1"])
+        self.notifier.wait_for_state("proc2", ProcessState.WAITING)
+        self._wait_assert_pd_dump(self._assert_process_states,
+                ProcessState.WAITING, ["proc2"])
+
+        # After a few more secs, proc2 should be restarted as well
+        time.sleep(time_to_throttle - (default_time_to_throttle + 1) + 1)
+
+        self.notifier.wait_for_state("proc2", ProcessState.RUNNING)
+        self._wait_assert_pd_dump(self._assert_process_states,
+                ProcessState.RUNNING, ["proc2"])
 
     def test_describe(self):
 
@@ -1234,6 +1436,16 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
 
         self._wait_assert_pd_dump(self._assert_process_states,
             ProcessState.TERMINATED, procs)
+
+        for i in range(3):
+            # retry this a few times to avoid a race between processes
+            # hitting WAITING state and the needs being registered
+            try:
+                self.epum_client.assert_needs(range(node_count + 1),
+                    domain_id_from_engine("engine1"))
+                break
+            except AssertionError:
+                time.sleep(0.01)
 
     def test_definitions(self):
         self.client.create_definition("d1", "t1", "notepad.exe")
@@ -1373,7 +1585,6 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
 
         # finally, end system boot mode. the remaining 2 U-P procs should be scheduled
         self.client.set_system_boot(False)
-
         self._wait_assert_pd_dump(self._assert_process_distribution,
                                   node_counts=[4],
                                   queued_count=1)
@@ -1383,6 +1594,96 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
         p5 = self.client.describe_process("p5")
         states = set([p2['state'], p5['state']])
         self.assertEqual(states, set([ProcessState.RUNNING, ProcessState.WAITING]))
+
+    def test_missing_ee(self):
+        """test_missing_ee
+
+        Ensure that the PD kills lingering processes on eeagents after they've been
+        evacuated.
+        """
+
+        # create some fake nodes and tell PD about them
+        node_1 = "node1"
+        domain_id = domain_id_from_engine("engine4")
+        self.client.node_state(node_1, domain_id, InstanceState.RUNNING)
+
+        # PD knows about this node but hasn't gotten a heartbeat yet
+
+        # spawn the eeagents and tell them all to heartbeat
+        eeagent_1 = self._spawn_eeagent(node_1, 1)
+
+        def assert_all_resources(state):
+            eeagent_nodes = set()
+            for resource in state['resources'].itervalues():
+                eeagent_nodes.add(resource['node_id'])
+            self.assertEqual(set([node_1]), eeagent_nodes)
+
+        self._wait_assert_pd_dump(assert_all_resources)
+        time_to_throttle = 0
+
+        self.client.schedule_process("p1", self.process_definition_id, execution_engine_id="engine4",
+            configuration=minimum_time_between_starts_config(time_to_throttle))
+
+        # Send a heartbeat to show the process is RUNNING, then wait for doctor
+        # to mark the eeagent missing
+        time.sleep(1)
+        eeagent_1.send_heartbeat()
+        self.notifier.wait_for_state('p1', ProcessState.RUNNING, timeout=30)
+        self.notifier.wait_for_state('p1', ProcessState.WAITING, timeout=30)
+
+        # Check that process is still 'Running' on the eeagent, even the PD has
+        # since marked it failed
+        eeagent_process = eeagent_1._get_process_with_upid('p1')
+        self.assertEqual(eeagent_process['u_pid'], 'p1')
+        self.assertEqual(eeagent_process['state'], ProcessState.RUNNING)
+        self.assertEqual(eeagent_process['round'], 0)
+
+        # Now send another heartbeat to start getting procs again
+        eeagent_1.send_heartbeat()
+        self.notifier.wait_for_state('p1', ProcessState.RUNNING, timeout=30)
+
+        eeagent_process = eeagent_1._get_process_with_upid('p1')
+        self.assertEqual(eeagent_process['u_pid'], 'p1')
+        self.assertEqual(eeagent_process['state'], ProcessState.RUNNING)
+        self.assertEqual(eeagent_process['round'], 1)
+
+        # The pd should now have rescheduled the proc, and terminated the
+        # lingering process
+        self.assertEqual(len(eeagent_1.history), 1)
+        terminated_history = eeagent_1.history[0]
+        self.assertEqual(terminated_history['u_pid'], 'p1')
+        self.assertEqual(terminated_history['state'], ProcessState.TERMINATED)
+        self.assertEqual(terminated_history['round'], 0)
+
+    def test_matchmaker_msg_retry(self):
+        node = "node1"
+        domain_id = domain_id_from_engine('engine1')
+        self.client.node_state(node, domain_id, InstanceState.RUNNING)
+        self._spawn_eeagent(node, 1)
+
+        # sneak in and shorten retry time
+        self.pd.matchmaker.process_launcher.retry_seconds = 0.5
+
+        proc1 = "proc1"
+        proc2 = "proc2"
+
+        with patch.object(self.pd.matchmaker.process_launcher, "resource_client") as mock_resource_client:
+            # first process request goes to mock, not real client but no error
+            self.client.schedule_process(proc1, self.process_definition_id)
+
+            # second process hits an error but that should not cause problems
+            mock_resource_client.launch_process.side_effect = Exception("boom!")
+            self.client.schedule_process(proc2, self.process_definition_id)
+
+            self._wait_assert_pd_dump(self._assert_process_states,
+                                      ProcessState.ASSIGNED, [proc1, proc2])
+            self.assertEqual(mock_resource_client.launch_process.call_count, 2)
+
+        # now resource client works again. those messages should be retried
+        self.notifier.wait_for_state(proc1, ProcessState.RUNNING)
+        self.notifier.wait_for_state(proc2, ProcessState.RUNNING)
+        self._wait_assert_pd_dump(self._assert_process_states,
+                                  ProcessState.RUNNING, [proc1, proc2])
 
 
 class ProcessDispatcherServiceZooKeeperTests(ProcessDispatcherServiceTests, ZooKeeperTestMixin):

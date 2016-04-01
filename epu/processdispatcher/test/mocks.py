@@ -1,13 +1,16 @@
+# Copyright 2013 University of Chicago
+
 import copy
-from itertools import chain
 import time
 import logging
 import threading
 from collections import defaultdict
+from datetime import datetime
 
-from epu.epumanagement.conf import *
+from epu.epumanagement.conf import *  # noqa
 from epu.exceptions import NotFoundError
 from epu.states import ProcessState
+from epu.util import now_datetime
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +53,7 @@ class MockEPUMClient(object):
         self.domain_subs = defaultdict(list)
 
     def describe_domain(self, domain_id):
-        #TODO this doesn't return the real describe format
+        # TODO this doesn't return the real describe format
         got_domain = self.domains.get(domain_id)
         if not got_domain:
             raise NotFoundError("Couldn't find domain %s" % domain_id)
@@ -139,7 +142,7 @@ class MockNotifier(object):
 
                 elapsed = time.time() - start
                 if elapsed >= timeout:
-                    raise Exception("timeout waiting for state")
+                    raise Exception("timeout waiting for state %s (had state %s)" % (state, process['state']))
 
                 self.condition.wait(timeout - elapsed)
 
@@ -157,7 +160,8 @@ class MockNotifier(object):
 
 
 class FakeEEAgent(object):
-    def __init__(self, dashi, heartbeat_dest, node_id, slot_count):
+    def __init__(self, name, dashi, heartbeat_dest, node_id, slot_count):
+        self.name = name
         self.dashi = dashi
         self.heartbeat_dest = heartbeat_dest
         self.node_id = node_id
@@ -167,12 +171,15 @@ class FakeEEAgent(object):
 
         # keep around old processes til they are cleaned up
         self.history = []
+        self.ready_event = threading.Event()
 
     def start(self):
         self.dashi.handle(self.launch_process)
         self.dashi.handle(self.terminate_process)
         self.dashi.handle(self.restart_process)
         self.dashi.handle(self.cleanup)
+
+        self.ready_event.set()
 
         self.dashi.consume()
 
@@ -186,19 +193,24 @@ class FakeEEAgent(object):
 
         log.debug("got launch_process request: %s", process)
 
-        if u_pid not in self.processes:
-            self.processes[u_pid] = process
+        key = self._make_key(u_pid, round)
+
+        if key not in self.processes:
+            self.processes[key] = process
+        else:
+            print "MOCK PROBLEM?? There's already a process with key %s" % key
         self.send_heartbeat()
 
     def terminate_process(self, u_pid, round):
-        process = self.processes.pop(u_pid)
+        key = self._make_key(u_pid, round)
+        process = self.processes.get(key)
         if process:
             process['state'] = ProcessState.TERMINATED
             self.history.append(process)
         self.send_heartbeat()
 
     def restart_process(self, u_pid, round):
-        process = self.processes.pop(u_pid)
+        process = self._get_process_with_upid(u_pid)
         if process:
             process['round'] = round
             process['state'] = ProcessState.RUNNING
@@ -206,14 +218,16 @@ class FakeEEAgent(object):
         self.send_heartbeat()
 
     def cleanup(self, u_pid, round):
-        if u_pid in self.history:
-            del self.history[u_pid]
+        key = self._make_key(u_pid, round)
+        process = self.processes.get(key)
+        if process:
+            del self.processes[key]
 
     def make_heartbeat(self, timestamp=None):
-        now = time.time() if timestamp is None else timestamp
+        now = now_datetime().isoformat() if timestamp is None else timestamp
 
         processes = []
-        for process in chain(self.processes.itervalues(), self.history):
+        for process in self.processes.itervalues():
             p = dict(upid=process['u_pid'], round=process['round'],
                      state=process['state'])
             processes.append(p)
@@ -227,16 +241,33 @@ class FakeEEAgent(object):
         self.dashi.fire(self.heartbeat_dest, "heartbeat", message=beat)
 
     def fail_process(self, u_pid):
-        process = self.processes.pop(u_pid)
-        process['state'] = ProcessState.FAILED
-        self.history.append(process)
+        process = self._get_process_with_upid(u_pid)
+        if process:
+            process['state'] = ProcessState.FAILED
+            self.history.append(process)
         self.send_heartbeat()
 
     def exit_process(self, u_pid):
-        process = self.processes.pop(u_pid)
-        process['state'] = ProcessState.EXITED
-        self.history.append(process)
+        process = self._get_process_with_upid(u_pid)
+        if process:
+            process['state'] = ProcessState.EXITED
+            self.history.append(process)
         self.send_heartbeat()
+
+    def _get_process_with_upid(self, u_pid):
+        for key in self.processes.keys():
+            if key.startswith(u_pid):
+                process = self.processes[key]
+                break
+        else:
+            process = None
+        return process
+
+    def _make_key(self, u_pid, round):
+        return "%s-%s" % (u_pid, round)
+
+    def _unmake_key(self, key):
+        u_pid, round = key.rsplit('-', 1)
 
 
 def get_definition():
@@ -253,3 +284,14 @@ def get_domain_config():
 
 def nosystemrestart_process_config():
     return {'process': {'omit_from_system_restart': True}}
+
+
+def minimum_time_between_starts_config(minimum_time=2):
+    return {'process': {'minimum_time_between_starts': minimum_time}}
+
+
+def make_beat(node_id, processes=None, timestamp=None):
+    if timestamp and isinstance(timestamp, datetime):
+        timestamp = timestamp.isoformat()
+    return {"node_id": node_id, "processes": processes or [],
+        "timestamp": timestamp or now_datetime().isoformat()}

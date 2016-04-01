@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 class IEpuManagementClient(object):
     """This is a fake interface class that contains the methods any EPU Management client
     implementation will have.  There can be several types of messaging implementations
@@ -27,9 +29,6 @@ class IEpuManagementClient(object):
     def instance_info(self, content):
         pass
 
-    def sensor_info(self, content):
-        pass
-
 
 class IProvisionerClient(object):
     """This is a fake interface class that contains the methods any provisioner client
@@ -49,6 +48,7 @@ class IProvisionerClient(object):
     def dump_state(self, nodes, force_subscribe=None):
         pass
 
+
 class ISubscriberNotifier(object):
     """This is a fake interface class that contains the methods any subscriber notifier
     implementation will have.  There can be several types of messaging implementations
@@ -61,6 +61,7 @@ class ISubscriberNotifier(object):
         @param message dict to send
         """
         pass
+
 
 class IOUAgentClient(object):
     """This is a fake interface class that contains the methods any OU Agent implementation

@@ -1,4 +1,7 @@
+# Copyright 2013 University of Chicago
+
 import logging
+import threading
 
 from dashi import bootstrap
 
@@ -20,7 +23,8 @@ class ProcessDispatcherService(object):
     """
 
     def __init__(self, amqp_uri=None, topic="process_dispatcher", registry=None,
-                 store=None, epum_client=None, notifier=None, definition_id=None, domain_config=None):
+                 store=None, epum_client=None, notifier=None, definition_id=None,
+                 domain_config=None, sysname=None):
 
         configs = ["service", "processdispatcher"]
         config_files = get_config_paths(configs)
@@ -28,15 +32,17 @@ class ProcessDispatcherService(object):
         self.topic = self.CFG.processdispatcher.get('service_name', topic)
 
         self.dashi = bootstrap.dashi_connect(self.topic, self.CFG,
-                                             amqp_uri=amqp_uri)
+                                             amqp_uri=amqp_uri, sysname=sysname)
 
         engine_conf = self.CFG.processdispatcher.get('engines', {})
         default_engine = self.CFG.processdispatcher.get('default_engine')
+        process_engines = self.CFG.processdispatcher.get('process_engines')
         if default_engine is None and len(engine_conf.keys()) == 1:
             default_engine = engine_conf.keys()[0]
         self.store = store or get_processdispatcher_store(self.CFG)
         self.store.initialize()
-        self.registry = registry or EngineRegistry.from_config(engine_conf, default=default_engine)
+        self.registry = registry or EngineRegistry.from_config(engine_conf,
+            default=default_engine, process_engines=process_engines)
         self.eeagent_client = EEAgentClient(self.dashi)
 
         domain_definition_id = None
@@ -67,12 +73,16 @@ class ProcessDispatcherService(object):
                                           self.notifier)
 
         launch_type = self.CFG.processdispatcher.get('launch_type', 'supd')
+        restart_throttling_config = self.CFG.processdispatcher.get('restart_throttling_config', {})
+        dispatch_retry_seconds = self.CFG.processdispatcher.get('dispatch_retry_seconds')
 
-        self.matchmaker = PDMatchmaker(self.store, self.eeagent_client,
+        self.matchmaker = PDMatchmaker(self.core, self.store, self.eeagent_client,
             self.registry, self.epum_client, self.notifier, self.topic,
-            domain_definition_id, base_domain_config, launch_type)
+            domain_definition_id, base_domain_config, launch_type,
+            restart_throttling_config, dispatch_retry_seconds)
 
-        self.doctor = PDDoctor(self.core, self.store)
+        self.doctor = PDDoctor(self.core, self.store, config=self.CFG)
+        self.ready_event = threading.Event()
 
     def start(self):
 
@@ -85,6 +95,8 @@ class ProcessDispatcherService(object):
         # (maybe not OUR doctor, but whoever gets elected), will check the
         # state of the system and then mark it as initialized.
         self.store.wait_initialized()
+
+        epu.dashiproc.link_dashi_exceptions(self.dashi)
 
         self.dashi.handle(self.set_system_boot)
         self.dashi.handle(self.create_definition)
@@ -101,8 +113,11 @@ class ProcessDispatcherService(object):
         self.dashi.handle(self.node_state)
         self.dashi.handle(self.heartbeat, sender_kwarg='sender')
         self.dashi.handle(self.dump)
+        self.dashi.handle(self.add_engine)
 
         self.matchmaker.start_election()
+
+        self.ready_event.set()
 
         try:
             self.dashi.consume()
@@ -112,6 +127,7 @@ class ProcessDispatcherService(object):
             log.info("Exiting normally. Bye!")
 
     def stop(self):
+        self.ready_event.clear()
         self.dashi.cancel()
         self.dashi.disconnect()
         self.store.shutdown()
@@ -183,6 +199,9 @@ class ProcessDispatcherService(object):
 
     def dump(self):
         return self.core.dump()
+
+    def add_engine(self, definition):
+        self.core.add_engine(definition)
 
 
 class SubscriberNotifier(object):

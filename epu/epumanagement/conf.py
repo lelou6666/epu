@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 # Confs for the Neediness API constraints
 
 CONF_IAAS_SITE = "iaas_site"
@@ -5,11 +7,6 @@ CONF_IAAS_ALLOCATION = "iaas_allocation"
 
 
 # Initial confs, see doc for epu.epumanagement.EPUManagement.__init__()
-
-EPUM_INITIALCONF_ZOOKEEPER_HOSTS = "zookeeper_hosts"
-EPUM_INITIALCONF_ZOOKEEPER_PATH = "zookeeper_path"
-EPUM_INITIALCONF_ZOOKEEPER_USERNAME = "zookeeper_username"
-EPUM_INITIALCONF_ZOOKEEPER_PASSWORD = "zookeeper_password"
 
 EPUM_INITIALCONF_PROC_NAME = "proc_name"
 EPUM_INITIALCONF_SERVICE_NAME = "service_name"
@@ -23,6 +20,7 @@ EPUM_INITIALCONF_DEFAULT_NEEDY_IAAS_ALLOC = "needy_default_iaas_allocation"
 EPUM_CONF_GENERAL = "general"
 EPUM_CONF_ENGINE_CLASS = "engine_class"
 EPUM_CONF_ENGINE = "engine_conf"
+EPUM_CONF_CHEF_CREDENTIAL = "chef_credential"
 EPUM_CONF_HEALTH = "health"
 EPUM_CONF_HEALTH_MONITOR = "monitor_health"
 EPUM_CONF_HEALTH_BOOT = "boot_timeout"
@@ -37,3 +35,6 @@ EPUM_RECORD_REAPING_DEFAULT_MAX_AGE = 7200
 # Other
 EPUM_DEFAULT_SERVICE_NAME = "epu_management_service"
 PROVISIONER_VARS_KEY = "provisioner_vars"
+
+EPUM_CONF_DECIDER_LOOP_INTERVAL = "decider_loop_interval"
+EPUM_DECIDER_DEFAULT_LOOP_INTERVAL = 5.0

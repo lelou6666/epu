@@ -1,10 +1,13 @@
+# Copyright 2013 University of Chicago
+
 import unittest
 import uuid
 
-from kazoo.exceptions import ConnectionLoss
+from kazoo.exceptions import KazooException
 
 from epu.dtrs.store import DTRSStore, DTRSZooKeeperStore
-from epu.exceptions import WriteConflictError, NotFoundError
+from epu.dtrs.core import CredentialType
+from epu.exceptions import WriteConflictError, NotFoundError, BadRequestError
 from epu.test import ZooKeeperTestMixin, SocatProxyRestartWrapper
 
 
@@ -29,11 +32,9 @@ class BaseDTRSStoreTests(unittest.TestCase):
         dt1_read = self.store.describe_dt('mr_white', dt_id_1)
         self.assertEqual(dt1["mappings"], dt1_read["mappings"])
 
-        # Get with a different user should throw an exception
-        try:
-            self.store.describe_dt('mr_pink', dt_id_1)
-        except NotFoundError:
-            pass
+        # Get with a different user should return None
+        dt1_pink_read = self.store.describe_dt('mr_pink', dt_id_1)
+        self.assertEqual(None, dt1_pink_read)
 
         # now make two changes, one from the original and one from what we read
         dt2 = dt1.copy()
@@ -44,8 +45,7 @@ class BaseDTRSStoreTests(unittest.TestCase):
 
         # Store another DT for the same user
         dt_id_2 = new_id()
-        dt2 = {"mappings": {"ec2.us-east-1": {"iaas_image": "ami-foobar",
-            "iaas_allocation": "m1.small"}}}
+        dt2 = {"mappings": {"ec2.us-east-1": {"iaas_image": "ami-foobar", "iaas_allocation": "m1.small"}}}
         self.store.add_dt('mr_white', dt_id_2, dt2)
 
         # Listing DTs should return both
@@ -55,84 +55,148 @@ class BaseDTRSStoreTests(unittest.TestCase):
         self.assertIn(dt_id_2, dts)
 
     def test_store_sites(self):
-        site_id_1 = new_id()
+        site_id_1 = new_common_id()
+        site_id_2 = new_common_id()
         site1 = {
-            "name": "ec2.us-east-1",
-            "description": "Amazon EC2, US East (Virginia)",
-            "driver_class": "libcloud.compute.drivers.ec2.EC2NodeDriver"
+            "type": "ec2",
+            "region": "eu-west-1"
         }
-        self.store.add_site(site_id_1, site1)
+        self.store.add_site(None, site_id_1, site1)
 
         # adding it again should error
         try:
-            self.store.add_site(site_id_1, site1)
+            self.store.add_site(None, site_id_1, site1)
         except WriteConflictError:
             pass
         else:
             self.fail("expected WriteConflictError")
 
-        site1_read = self.store.describe_site(site_id_1)
-        self.assertEqual(site1["name"], site1_read["name"])
-        self.assertEqual(site1["description"], site1_read["description"])
-        self.assertEqual(site1["driver_class"], site1_read["driver_class"])
+        site1_read = self.store.describe_site(None, site_id_1)
+        self.assertEqual(site1["type"], site1_read["type"])
+        self.assertEqual(site1["region"], site1_read["region"])
 
-        # Get with a different user should throw an exception
-        try:
-            self.store.describe_site(site_id_1)
-        except NotFoundError:
-            pass
+        # Get with an unknown ID should return None
+        site2 = self.store.describe_site(None, site_id_2)
+        self.assertEqual(None, site2)
 
         # now make two changes, one from the original and one from what we read
         site2 = site1.copy()
-        site2["description"] = "Nimbus"
-        self.store.update_site(site_id_1, site2)
-        site2_read = self.store.describe_site(site_id_1)
-        self.assertEqual("Nimbus", site2_read["description"])
+        site2["region"] = "us-west-2"
+        self.store.update_site(None, site_id_1, site2)
+        site2_read = self.store.describe_site(None, site_id_1)
+        self.assertEqual("us-west-2", site2_read["region"])
 
-        # Store another site for the same user
-        site_id_2 = new_id()
+        # Store another site
         site2 = {
-            "name": "futuregrid.hotel",
-            "description": "Nimbus cloud on the Hotel FutureGrid site",
-            "driver_class": "libcloud.compute.drivers.ec2.NimbusNodeDriver",
-            "driver_kwargs": {
-                "host": "svc.uc.futuregrid.org",
-                "port": 8444
-            }
+            "type": "nimbus",
+            "host": "svc.uc.futuregrid.org",
+            "port": 8444,
+            "secure": True
         }
-        self.store.add_site(site_id_2, site2)
+        self.store.add_site(None, site_id_2, site2)
 
         # Listing sites should return both
-        sites = self.store.list_sites()
+        sites = self.store.list_sites(None)
+        self.assertEqual(len(sites), 2)
+        self.assertIn(site_id_1, sites)
+        self.assertIn(site_id_2, sites)
+
+        # Now testing with a caller parameter
+
+        # Listing sites should return both common sites
+        sites = self.store.list_sites("mr_white")
+        self.assertEqual(len(sites), 2)
+
+        # Describe a common site should work too
+        site2_read = self.store.describe_site("mr_white", site_id_2)
+        self.assertEqual(site2["type"], site2_read["type"])
+        self.assertEqual(site2["host"], site2_read["host"])
+        self.assertEqual(site2["port"], site2_read["port"])
+
+        own_site_id = new_id()
+        own_site = {
+            "type": "openstack",
+            "host": "openstack.example.com",
+            "port": 5678
+        }
+
+        # Add a new user site
+        self.store.add_site("mr_white", own_site_id, own_site)
+        sites = self.store.list_sites("mr_white")
+        self.assertEqual(len(sites), 3)
+        own_site_read = self.store.describe_site("mr_white", own_site_id)
+        self.assertEqual(own_site["type"], own_site_read["type"])
+        self.assertEqual(own_site["host"], own_site_read["host"])
+
+        # It should not be visible by another user
+        sites = self.store.list_sites("mr_pink")
+        self.assertEqual(len(sites), 2)
+        own_site_read = self.store.describe_site("mr_pink", own_site_id)
+        self.assertEqual(None, own_site_read)
+
+        # Add site should not work with a common site prefix
+        try:
+            self.store.add_site("mr_white", site_id_1, own_site)
+        except BadRequestError:
+            pass
+        else:
+            self.fail("expected BadRequestError")
+
+        # Update site should not work on common sites
+        try:
+            self.store.update_site("mr_white", site_id_1, own_site)
+        except NotFoundError:
+            pass
+        else:
+            self.fail("expected NotFoundError")
+
+        own_site["port"] = 7890
+        self.store.update_site("mr_white", own_site_id, own_site)
+        sites = self.store.list_sites("mr_white")
+        self.assertEqual(len(sites), 3)
+        own_site_read = self.store.describe_site("mr_white", own_site_id)
+        self.assertEqual(own_site["type"], own_site_read["type"])
+        self.assertEqual(own_site["host"], own_site_read["host"])
+
+        # Removing a common site should not work for a user
+        try:
+            self.store.remove_site("mr_white", site_id_1)
+        except NotFoundError:
+            pass
+        else:
+            self.fail("expected NotFoundError")
+        sites = self.store.list_sites("mr_white")
+        self.assertEqual(len(sites), 3)
+
+        self.store.remove_site("mr_white", own_site_id)
+        sites = self.store.list_sites("mr_white")
         self.assertEqual(len(sites), 2)
         self.assertIn(site_id_1, sites)
         self.assertIn(site_id_2, sites)
 
     def test_store_credentials(self):
-        site_id_1 = new_id()
+        site_id_1 = new_common_id()
         site1 = {
-            "name": "ec2.us-east-1",
-            "description": "Amazon EC2, US East (Virginia)",
-            "driver_class": "libcloud.compute.drivers.ec2.EC2NodeDriver"
+            "type": "ec2",
+            "region": "eu-west-1"
         }
-        self.store.add_site(site_id_1, site1)
+        self.store.add_site(None, site_id_1, site1)
 
         credentials_1 = {
-           "access_key": "EC2_ACCESS_KEY",
-           "secret_key": "EC2_SECRET_KEY",
-           "key_name": "EC2_KEYPAIR"
+            "access_key": "EC2_ACCESS_KEY",
+            "secret_key": "EC2_SECRET_KEY",
+            "key_name": "EC2_KEYPAIR"
         }
-        self.store.add_credentials('mr_white', site_id_1, credentials_1)
+        self.store.add_credentials('mr_white', CredentialType.SITE, site_id_1, credentials_1)
 
         # adding it again should error
-        try:
-            self.store.add_credentials('mr_white', site_id_1, credentials_1)
-        except WriteConflictError:
-            pass
-        else:
-            self.fail("expected WriteConflictError")
+        with self.assertRaises(WriteConflictError):
+            self.store.add_credentials('mr_white', CredentialType.SITE, site_id_1, credentials_1)
 
-        credentials_1_read = self.store.describe_credentials('mr_white', site_id_1)
+        # but another type should succeed
+        self.store.add_credentials('mr_white', CredentialType.CHEF, site_id_1, credentials_1)
+
+        credentials_1_read = self.store.describe_credentials('mr_white', CredentialType.SITE, site_id_1)
         self.assertEqual(credentials_1["access_key"], credentials_1_read["access_key"])
         self.assertEqual(credentials_1["secret_key"], credentials_1_read["secret_key"])
         self.assertEqual(credentials_1["key_name"], credentials_1_read["key_name"])
@@ -140,19 +204,16 @@ class BaseDTRSStoreTests(unittest.TestCase):
         # now make two changes, one from the original and one from what we read
         credentials_2 = credentials_1.copy()
         credentials_2["key_name"] = "NEW_KEY"
-        self.store.update_credentials('mr_white', site_id_1, credentials_2)
-        credentials_2_read = self.store.describe_credentials('mr_white', site_id_1)
+        self.store.update_credentials('mr_white', CredentialType.SITE, site_id_1, credentials_2)
+        credentials_2_read = self.store.describe_credentials('mr_white', CredentialType.SITE, site_id_1)
         self.assertEqual("NEW_KEY", credentials_2_read["key_name"])
 
-        # Get with a different user should throw an exception
-        try:
-            credentials_1_read = self.store.describe_credentials('mr_pink',
-                    site_id_1)
-        except NotFoundError:
-            pass
+        # Get with a different user should return None
+        credentials_1_read = self.store.describe_credentials('mr_pink', CredentialType.SITE, site_id_1)
+        self.assertEqual(None, credentials_1_read)
 
         # Listing credentials should return both
-        credentials = self.store.list_credentials('mr_white')
+        credentials = self.store.list_credentials('mr_white', CredentialType.SITE)
         self.assertEqual([site_id_1], credentials)
 
 
@@ -198,8 +259,12 @@ class DTRSZooKeeperStoreProxyKillsTests(BaseDTRSStoreTests, ZooKeeperTestMixin):
             self.store.kazoo.get("/")
         self.real_store.fake_operation = fake_operation
 
-        self.assertRaises(ConnectionLoss, self.store.fake_operation)
+        self.assertRaises(KazooException, self.store.fake_operation)
 
 
 def new_id():
     return str(uuid.uuid4())
+
+
+def new_common_id():
+    return str("common::" + new_id())

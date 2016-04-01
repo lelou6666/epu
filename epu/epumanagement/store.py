@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import time
 import simplejson as json
@@ -11,11 +13,11 @@ from kazoo.exceptions import NodeExistsException, BadVersionException,\
     NoNodeException
 
 import epu.tevent as tevent
-from epu.epumanagement.core import EngineState, SensorItemParser, InstanceParser, CoreInstance
+from epu.epumanagement.core import EngineState, InstanceParser, CoreInstance
 from epu.states import InstanceState, InstanceHealthState
 from epu.exceptions import NotFoundError, WriteConflictError
 from epu import zkutil
-from epu.epumanagement.conf import *
+from epu.epumanagement.conf import *  # noqa
 
 
 log = logging.getLogger(__name__)
@@ -31,7 +33,7 @@ def get_epum_store(config, service_name, use_gevent=False, proc_name=None):
 
         store = ZooKeeperEPUMStore(service_name, zookeeper['hosts'],
             zookeeper['path'], username=zookeeper.get('username'),
-            password=zookeeper.get('password'),
+            password=zookeeper.get('password'), use_gevent=use_gevent,
             timeout=zookeeper.get('timeout'), proc_name=proc_name)
 
     else:
@@ -164,7 +166,6 @@ class DomainStore(object):
 
     def __init__(self, owner, domain_id):
         self.instance_parser = InstanceParser()
-        self.sensor_parser = SensorItemParser()
         self.owner = owner
         self.domain_id = domain_id
 
@@ -244,7 +245,7 @@ class DomainStore(object):
         """Return True if the EPUM_CONF_HEALTH_MONITOR setting is True
         """
         health_conf = self.get_health_config()
-        if not health_conf.has_key(EPUM_CONF_HEALTH_MONITOR):
+        if EPUM_CONF_HEALTH_MONITOR not in health_conf:
             return False
         else:
             return bool(health_conf[EPUM_CONF_HEALTH_MONITOR])
@@ -344,6 +345,27 @@ class DomainStore(object):
                 return True
             # instance was probably a duplicate
             return False
+        return False
+
+    def mark_instance_terminating(self, instance_id):
+        """Mark an instance for termination
+
+        returns True/False indicating where instance was updated
+        """
+        while 1:
+            instance = self.get_instance(instance_id)
+            if not instance or instance.state >= InstanceState.TERMINATING:
+                return False
+
+            d = dict(instance.iteritems())
+            d['state'] = InstanceState.TERMINATING
+            newinstance = CoreInstance(**d)
+
+            try:
+                self.update_instance(newinstance, previous=instance)
+                return True
+            except WriteConflictError:
+                pass
 
     def new_instance_launch(self, deployable_type_id, instance_id, launch_id, site, allocation,
                             extravars=None, timestamp=None):
@@ -366,6 +388,7 @@ class DomainStore(object):
                             deployable_type=deployable_type_id,
                             extravars=extravars)
         self.add_instance(instance)
+        return instance
 
     def new_instance_health(self, instance_id, health_state, error_time=None, errors=None, caller=None):
         """Record instance health change
@@ -390,7 +413,7 @@ class DomainStore(object):
         d['caller'] = caller
 
         if errors:
-            log.error("Got error heartbeat from instance %s. State: %s. "+
+            log.error("Got error heartbeat from instance %s. State: %s. " +
                       "Health: %s. Errors: %s", instance_id, instance.state,
                       health_state, errors)
 
@@ -482,6 +505,9 @@ class LocalEPUMStore(EPUMStore):
         self.local_reaper_ref = None
 
     def initialize(self):
+        pass
+
+    def shutdown(self):
         pass
 
     def _change_decider(self, make_leader):
@@ -683,13 +709,13 @@ class LocalDomainStore(DomainStore):
         self.health_config = {}
         self.general_config = {}
         if config:
-            if config.has_key(EPUM_CONF_GENERAL):
+            if EPUM_CONF_GENERAL in config:
                 self.add_general_config(config[EPUM_CONF_GENERAL])
 
-            if config.has_key(EPUM_CONF_ENGINE):
+            if EPUM_CONF_ENGINE in config:
                 self.add_engine_config(config[EPUM_CONF_ENGINE])
 
-            if config.has_key(EPUM_CONF_HEALTH):
+            if EPUM_CONF_HEALTH in config:
                 self.add_health_config(config[EPUM_CONF_HEALTH])
         self.engine_state = EngineState()
 
@@ -699,7 +725,6 @@ class LocalDomainStore(DomainStore):
         self.instance_heartbeats = {}
 
         self.domain_sensor_data = {}
-
 
     def is_removed(self):
         """Whether this domain has been marked for removal
@@ -719,7 +744,7 @@ class LocalDomainStore(DomainStore):
         """
 
         if keys is None:
-            d = dict((k, json.loads(v)) for k,v in self.engine_config.iteritems())
+            d = dict((k, json.loads(v)) for k, v in self.engine_config.iteritems())
         else:
             d = dict((k, json.loads(self.engine_config[k]))
                 for k in keys if k in self.engine_config)
@@ -742,7 +767,7 @@ class LocalDomainStore(DomainStore):
 
         @param conf dictionary mapping strings to JSON-serializable objects
         """
-        for k,v in conf.iteritems():
+        for k, v in conf.iteritems():
             self.engine_config[k] = json.dumps(v)
         self.engine_config_version += 1
 
@@ -774,7 +799,7 @@ class LocalDomainStore(DomainStore):
         @retval config dictionary object
         """
         if keys is None:
-            d = dict((k, json.loads(v)) for k,v in self.health_config.iteritems())
+            d = dict((k, json.loads(v)) for k, v in self.health_config.iteritems())
         else:
             d = dict((k, json.loads(self.health_config[k]))
                 for k in keys if k in self.health_config)
@@ -789,7 +814,7 @@ class LocalDomainStore(DomainStore):
 
         @param conf dictionary mapping strings to JSON-serializable objects
         """
-        for k,v in conf.iteritems():
+        for k, v in conf.iteritems():
             self.health_config[k] = json.dumps(v)
 
     def get_general_config(self, keys=None):
@@ -799,7 +824,7 @@ class LocalDomainStore(DomainStore):
         @retval config dictionary object
         """
         if keys is None:
-            d = dict((k, json.loads(v)) for k,v in self.general_config.iteritems())
+            d = dict((k, json.loads(v)) for k, v in self.general_config.iteritems())
         else:
             d = dict((k, json.loads(self.general_config[k]))
                 for k in keys if k in self.general_config)
@@ -814,7 +839,7 @@ class LocalDomainStore(DomainStore):
 
         @param conf dictionary mapping strings to JSON-serializable objects
         """
-        for k,v in conf.iteritems():
+        for k, v in conf.iteritems():
             self.general_config[k] = json.dumps(v)
 
     def get_subscribers(self):
@@ -911,7 +936,7 @@ class LocalDomainStore(DomainStore):
         next invocation of this method.
         """
         s = self.engine_state
-        #TODO not yet dealing with sensors or change lists
+        # TODO not yet dealing with sensors or change lists
         s.sensors = self.get_domain_sensor_data()
         s.instances = dict((i.instance_id, i) for i in self.get_instances())
         return s
@@ -943,7 +968,8 @@ class ZooKeeperEPUMStore(EPUMStore):
     DOMAINS_PATH = "/domains"
     DEFINITIONS_PATH = "/definitions"
 
-    def __init__(self, service_name, hosts, base_path, username=None, password=None, timeout=None, use_gevent=False, proc_name=None):
+    def __init__(self, service_name, hosts, base_path, username=None, password=None,
+                 timeout=None, use_gevent=False, proc_name=None):
         super(ZooKeeperEPUMStore, self).__init__()
 
         self.service_name = service_name
@@ -988,10 +1014,17 @@ class ZooKeeperEPUMStore(EPUMStore):
         for path in (self.DOMAINS_PATH, self.DEFINITIONS_PATH):
             self.kazoo.ensure_path(path)
 
+    def shutdown(self):
+        self.kazoo.stop()
+        try:
+            self.kazoo.close()
+        except Exception:
+            log.exception("Problem cleaning up kazoo")
+
     def _connection_state_listener(self, state):
         # called by kazoo when the connection state changes.
         # handle in background
-        state_listener = tevent.spawn(self._handle_connection_state, state)
+        tevent.spawn(self._handle_connection_state, state)
 
     def _handle_connection_state(self, state):
 
@@ -1156,7 +1189,7 @@ class ZooKeeperEPUMStore(EPUMStore):
     def list_domains(self):
         """Retrieve a list of (owner, domain) pairs
         """
-        #parallelize this?
+        # parallelize this?
 
         owners = self.retry(self.kazoo.get_children, self.DOMAINS_PATH)
 
@@ -1201,7 +1234,7 @@ class ZooKeeperEPUMStore(EPUMStore):
 
         validate_entity_name(instance_id)
 
-        #TODO speed this up with a lookup table from instance ID to domainid/owner
+        # TODO speed this up with a lookup table from instance ID to domainid/owner
         # at the same time, we can centralize the ID generating and even switch to
         # more legible IDs. DI-XXXXXXX and DL-XXXXXXX (Domain Instance and Domain
         # Launch)
@@ -1638,7 +1671,6 @@ class ZooKeeperDomainStore(DomainStore):
         Raise a NotFoundError if the instance is unknown
         """
 
-
         path = self._get_instance_path(instance_id)
         try:
             instance_json, stat = self.retry(self.kazoo.get, path)
@@ -1727,7 +1759,7 @@ class ZooKeeperDomainStore(DomainStore):
         next invocation of this method.
         """
         s = self.engine_state
-        #TODO not yet dealing with sensors or change lists
+        # TODO not yet dealing with sensors or change lists
         s.instances = dict((i.instance_id, i) for i in self.get_instances())
         return s
 
@@ -1750,9 +1782,11 @@ class ZooKeeperDomainDefinitionStore(DomainDefinitionStore):
 
 
 _INVALID_NAMES = ("..", ".", "zookeeper")
+
+
 def validate_entity_name(name):
     """validation for owner and domain_id strings
     """
     if (not name or re.match('[^a-zA-Z0-9_\-.@]', name)
-        or name in _INVALID_NAMES):
+            or name in _INVALID_NAMES):
         raise ValueError("invalid name: %s" % name)

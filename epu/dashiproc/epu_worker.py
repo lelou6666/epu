@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import os
 import time
 import logging
@@ -6,6 +8,7 @@ import dashi.bootstrap as bootstrap
 
 from epu.util import get_config_paths
 from epu import cei_events
+
 
 class EPUWorkerService(object):
 
@@ -27,19 +30,17 @@ class EPUWorkerService(object):
         except:
             self.log.warning("gevent not available. Falling back to threading")
 
-
         self.queue_name_work = self.CFG.queue_name_work
-        extradict = {"queue_name_work":self.queue_name_work}
+        extradict = {"queue_name_work": self.queue_name_work}
 
         cei_events.event("worker", "init_begin", extra=extradict)
 
         self.dashi = bootstrap.dashi_connect(self.topic, self.CFG)
 
-
     def start(self):
 
         self.dashi.handle(self.work)
-        extradict = {"queue_name_work":self.queue_name_work}
+        extradict = {"queue_name_work": self.queue_name_work}
         cei_events.event("worker", "init_end", extra=extradict)
 
         try:
@@ -56,7 +57,7 @@ class EPUWorkerService(object):
         self.log.info("WORK: sleeping for %d seconds ---" % work_amount)
         time.sleep(work_amount)
         cei_events.event("worker", "job_end", extra=extradict)
-        return {"result":"work_complete"}
+        return {"result": "work_complete"}
 
 
 def main():

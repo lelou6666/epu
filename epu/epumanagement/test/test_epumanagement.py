@@ -1,13 +1,17 @@
+# Copyright 2013 University of Chicago
+
 import copy
 import unittest
 import logging
 import time
+import threading
 
 from epu.decisionengine.impls.simplest import CONF_PRESERVE_N
 from epu.epumanagement import EPUManagement
-from epu.epumanagement.test.mocks import FakeDomainStore, MockSubscriberNotifier, MockProvisionerClient, MockOUAgentClient, MockDTRSClient
+from epu.epumanagement.test.mocks import FakeDomainStore, MockSubscriberNotifier, \
+    MockProvisionerClient, MockOUAgentClient, MockDTRSClient
 from epu.epumanagement.store import LocalEPUMStore
-from epu.epumanagement.conf import *
+from epu.epumanagement.conf import *  # noqa
 from epu.exceptions import NotFoundError, WriteConflictError
 from epu.states import InstanceState
 from epu.sensors import Statistics
@@ -16,6 +20,7 @@ from epu.decisionengine.impls.sensor import CONF_SENSOR_TYPE
 log = logging.getLogger(__name__)
 
 MOCK_PKG = "epu.epumanagement.test.mocks"
+
 
 class EPUManagementBasicTests(unittest.TestCase):
     """
@@ -32,7 +37,9 @@ class EPUManagementBasicTests(unittest.TestCase):
         self.dtrs_client = MockDTRSClient()
         self.epum_store = LocalEPUMStore(EPUM_DEFAULT_SERVICE_NAME)
         self.epum_store.initialize()
-        self.epum = EPUManagement(initial_conf, self.notifier, self.provisioner_client, self.ou_client, self.dtrs_client, store=self.epum_store)
+        self.epum = EPUManagement(
+            initial_conf, self.notifier, self.provisioner_client, self.ou_client,
+            self.dtrs_client, store=self.epum_store)
 
         # For instance-state changes "from the provisioner"
         self.provisioner_client._set_epum(self.epum)
@@ -43,13 +50,13 @@ class EPUManagementBasicTests(unittest.TestCase):
     def _config_mock1(self):
         """Keeps increment count
         """
-        engine = {CONF_PRESERVE_N:1}
+        engine = {CONF_PRESERVE_N: 1}
         return {EPUM_CONF_ENGINE: engine}
 
     def _definition_mock1(self):
         general = {EPUM_CONF_ENGINE_CLASS: MOCK_PKG + ".MockDecisionEngine01"}
         health = {EPUM_CONF_HEALTH_MONITOR: False}
-        return {EPUM_CONF_GENERAL:general, EPUM_CONF_HEALTH: health}
+        return {EPUM_CONF_GENERAL: general, EPUM_CONF_HEALTH: health}
 
     def _definition_mock2(self):
         """decide and reconfigure fail
@@ -69,19 +76,26 @@ class EPUManagementBasicTests(unittest.TestCase):
         engine_class = "epu.decisionengine.impls.simplest.SimplestEngine"
         general = {EPUM_CONF_ENGINE_CLASS: engine_class}
         health = {EPUM_CONF_HEALTH_MONITOR: False}
-        return {EPUM_CONF_GENERAL:general, EPUM_CONF_HEALTH: health}
+        return {EPUM_CONF_GENERAL: general, EPUM_CONF_HEALTH: health}
 
     def _config_simplest_domainconf(self, n_preserving):
         """Get 'simplest' domain conf with specified NPreserving policy
         """
-        engine = {CONF_PRESERVE_N:n_preserving}
+        engine = {CONF_PRESERVE_N: n_preserving}
         return {EPUM_CONF_ENGINE: engine}
+
+    def _config_simplest_chef_domainconf(self, n_preserving, chef_credential):
+        """Get 'simplest' domain conf with specified NPreserving policy
+        """
+        engine = {CONF_PRESERVE_N: n_preserving}
+        general = {EPUM_CONF_CHEF_CREDENTIAL: chef_credential}
+        return {EPUM_CONF_ENGINE: engine, EPUM_CONF_GENERAL: general}
 
     def _get_sensor_domain_definition(self):
         engine_class = "epu.decisionengine.impls.sensor.SensorEngine"
         general = {EPUM_CONF_ENGINE_CLASS: engine_class}
         health = {EPUM_CONF_HEALTH_MONITOR: False}
-        return {EPUM_CONF_GENERAL:general, EPUM_CONF_HEALTH: health}
+        return {EPUM_CONF_GENERAL: general, EPUM_CONF_HEALTH: health}
 
     def _config_sensor_domainconf(self, minimum_n):
         """Get 'sensor' domain conf with mock aggregator
@@ -92,8 +106,8 @@ class EPUManagementBasicTests(unittest.TestCase):
                   'deployable_type': 'fake',
                  'minimum_vms': minimum_n,
                  'metric': 'load',
-                 'monitor_sensors': ['load',],
-                 'monitor_domain_sensors': ['queuelen',],
+                 'monitor_sensors': ['load', ],
+                 'monitor_domain_sensors': ['queuelen', ],
                  'sample_function': 'Average'}
         return {EPUM_CONF_ENGINE: engine}
 
@@ -261,7 +275,7 @@ class EPUManagementBasicTests(unittest.TestCase):
         # reconfigure test
         self.assertEqual(domain_engine1.reconfigure_count, 0)
         self.assertEqual(domain_engine2.reconfigure_count, 0)
-        domain_config2 = {EPUM_CONF_ENGINE: {CONF_PRESERVE_N:2}}
+        domain_config2 = {EPUM_CONF_ENGINE: {CONF_PRESERVE_N: 2}}
         self.epum.msg_reconfigure_domain(owner, domain_name1, domain_config2)
 
         # should not take effect immediately, a reconfigure is external msg handled by reactor worker
@@ -291,6 +305,18 @@ class EPUManagementBasicTests(unittest.TestCase):
         self.epum.msg_add_domain("owner1", "testing123", "definition1", domain_config)
         self.epum._run_decisions()
         self.assertEqual(self.provisioner_client.provision_count, 2)
+
+    def test_basic_chef_domain(self):
+        self.epum.initialize()
+        domain_config = self._config_simplest_chef_domainconf(2, "chef1")
+        definition = {}
+        self.epum.msg_add_domain_definition("definition1", definition)
+        self.epum.msg_add_domain("owner1", "testing123", "definition1", domain_config)
+        self.epum._run_decisions()
+        self.assertEqual(self.provisioner_client.provision_count, 2)
+        # ensure chef credential name is passed through in provisioner vars
+        self.assertEqual(self.provisioner_client.launches[0]['vars']['chef_credential'], 'chef1')
+        self.assertEqual(self.provisioner_client.launches[1]['vars']['chef_credential'], 'chef1')
 
     def test_reconfigure_npreserving(self):
         """
@@ -410,6 +436,70 @@ class EPUManagementBasicTests(unittest.TestCase):
         self.assertEqual(domain1.domain_id, domain_name1)
         self.assertEqual(domain2.domain_id, domain_name2)
 
+    def test_decider_retries(self):
+        self.epum.initialize()
+        definition_id = "definition1"
+        definition = self._get_simplest_domain_definition()
+        domain_config = self._config_simplest_domainconf(2)
+        owner = "owner1"
+        domain_name = "domain1"
+        self.epum.msg_add_domain_definition(definition_id, definition)
+        self.epum.msg_add_domain(owner, domain_name, definition_id, domain_config)
+        self.epum._run_decisions()
+        self.assertEqual(self.provisioner_client.provision_count, 2)
+        self.assertEqual(len(self.provisioner_client.launched_instance_ids), 2)
+
+        # sneak into decider internals and patch out retry interval, to speed test
+        for controls in self.epum.decider.controls.values():
+            controls._retry_seconds = 0.5
+
+        # rerun decisions. no retries should happen
+        self.epum._run_decisions()
+        self.assertEqual(self.provisioner_client.provision_count, 2)
+        self.assertEqual(len(self.provisioner_client.launched_instance_ids), 2)
+
+        # provide REQUESTED state for first instance. should not retried
+        self.provisioner_client.report_node_state(
+            InstanceState.REQUESTED,
+            self.provisioner_client.launched_instance_ids[0])
+
+        # wait until a retry should be expected
+        time.sleep(0.6)
+        self.epum._run_decisions()
+        self.assertEqual(self.provisioner_client.provision_count, 3)
+        self.assertEqual(len(set(self.provisioner_client.launched_instance_ids)), 2)
+        self.assertEqual(self.provisioner_client.launched_instance_ids[1],
+            self.provisioner_client.launched_instance_ids[2])
+
+        # now kill the instances.
+        domain_config = self._config_simplest_domainconf(0)
+        self.epum.msg_reconfigure_domain(owner, domain_name, domain_config)
+        self.epum._run_decisions()
+        self.assertEqual(self.provisioner_client.provision_count, 3)
+        self.assertEqual(self.provisioner_client.terminate_node_count, 2)
+        self.assertEqual(len(self.provisioner_client.terminated_instance_ids), 2)
+
+        # should be no retries immediately
+        self.epum._run_decisions()
+        self.assertEqual(self.provisioner_client.provision_count, 3)
+        self.assertEqual(self.provisioner_client.terminate_node_count, 2)
+        self.assertEqual(len(self.provisioner_client.terminated_instance_ids), 2)
+
+        # provide TERMINATED state for first instance. should not retried
+        self.provisioner_client.report_node_state(
+            InstanceState.TERMINATED,
+            self.provisioner_client.terminated_instance_ids[0])
+
+        # wait until a retry should be expected
+        time.sleep(0.6)
+        self.epum._run_decisions()
+        self.epum._run_decisions()
+        self.assertEqual(self.provisioner_client.provision_count, 3)
+        self.assertEqual(self.provisioner_client.terminate_node_count, 3)
+        self.assertEqual(len(self.provisioner_client.terminated_instance_ids), 3)
+        self.assertEqual(self.provisioner_client.terminated_instance_ids[1],
+            self.provisioner_client.terminated_instance_ids[2])
+
     def test_failing_engine_decide(self):
         """Exceptions during decide cycle should not affect EPUM.
         """
@@ -421,7 +511,7 @@ class EPUManagementBasicTests(unittest.TestCase):
         self.epum.msg_add_domain("joeowner", "fail_domain", fail_definition_id, config)
         self.epum._run_decisions()
         # digging into internal structure to get engine instance
-        domain_engine = self.epum.decider.engines[("joeowner","fail_domain")]
+        domain_engine = self.epum.decider.engines[("joeowner", "fail_domain")]
         self.assertEqual(domain_engine.decide_count, 1)
 
     def test_failing_engine_reconfigure(self):
@@ -436,11 +526,11 @@ class EPUManagementBasicTests(unittest.TestCase):
         self.epum._run_decisions()
 
         # digging into internal structure to get engine instance
-        domain_engine = self.epum.decider.engines[("owner","fail_domain")]
+        domain_engine = self.epum.decider.engines[("owner", "fail_domain")]
         self.assertEqual(domain_engine.decide_count, 1)
         self.assertEqual(domain_engine.reconfigure_count, 0)
 
-        config2 = {EPUM_CONF_ENGINE: {CONF_PRESERVE_N:2}}
+        config2 = {EPUM_CONF_ENGINE: {CONF_PRESERVE_N: 2}}
         self.epum.msg_reconfigure_domain("owner", "fail_domain", config2)
         self.epum._run_decisions()
         self.assertEqual(domain_engine.decide_count, 2)
@@ -482,7 +572,7 @@ class EPUManagementBasicTests(unittest.TestCase):
         # Test describe
         not_found_error = False
         try:
-            got_domain = self.epum.msg_describe_domain(disallowed_user, domain_name)
+            self.epum.msg_describe_domain(disallowed_user, domain_name)
         except NotFoundError:
             not_found_error = True
         msg = "Non-permitted user was able to describe an domain he didn't own!"
@@ -497,7 +587,6 @@ class EPUManagementBasicTests(unittest.TestCase):
         permitted_domains = self.epum.msg_list_domains(permitted_user)
         self.assertEqual(len(permitted_domains), 1)
 
-
         # Test reconfigure
         new_config = {}
         not_found_error = False
@@ -510,7 +599,6 @@ class EPUManagementBasicTests(unittest.TestCase):
 
         self.epum.msg_reconfigure_domain(permitted_user, domain_name, new_config)
         # TODO: test adding with a dt that user doesn't own
-
 
         # Test Remove
         not_found_error = False
@@ -530,8 +618,6 @@ class EPUManagementBasicTests(unittest.TestCase):
         definition1 = self._definition_mock1()
         definition2_name = "definition2"
         definition2 = self._definition_mock2()
-
-        config = self._config_mock1()
 
         self.epum.msg_add_domain_definition(definition1_name, definition1)
 
@@ -608,21 +694,15 @@ class EPUManagementBasicTests(unittest.TestCase):
         definition_name = "def123"
         definition = self._get_simplest_domain_definition()
 
-        wrong_config = {EPUM_CONF_ENGINE: {}}
-        ok_config = self._config_simplest_domainconf(1)
-
         self.epum.msg_add_domain_definition(definition_name, definition)
         desc = self.epum.msg_describe_domain_definition(definition_name)
-        self.assertTrue(desc.has_key("documentation"))
+        self.assertTrue("documentation" in desc)
 
     def test_reaper(self):
         self.epum.initialize()
-        definition = self._get_simplest_domain_definition()
-        domain2_config = self._config_simplest_domainconf(1)
         config = self._config_mock1()
         owner = "owner1"
         domain_id = "testing123"
-        definition_id = "def123"
 
         # inject the FakeState instance directly instead of using msg_add_domain()
         self.state = FakeDomainStore(owner, domain_id, config)
@@ -634,12 +714,14 @@ class EPUManagementBasicTests(unittest.TestCase):
         self.state.new_fake_instance_state("n1", InstanceState.RUNNING, now - EPUM_RECORD_REAPING_DEFAULT_MAX_AGE - 1)
 
         # Three in terminal state and outdated
-        self.state.new_fake_instance_state("n2", InstanceState.TERMINATED, now - EPUM_RECORD_REAPING_DEFAULT_MAX_AGE - 1)
+        self.state.new_fake_instance_state(
+            "n2", InstanceState.TERMINATED, now - EPUM_RECORD_REAPING_DEFAULT_MAX_AGE - 1)
         self.state.new_fake_instance_state("n3", InstanceState.REJECTED, now - EPUM_RECORD_REAPING_DEFAULT_MAX_AGE - 1)
         self.state.new_fake_instance_state("n4", InstanceState.FAILED, now - EPUM_RECORD_REAPING_DEFAULT_MAX_AGE - 1)
 
         # Three in terminal state and not yet outdated
-        self.state.new_fake_instance_state("n5", InstanceState.TERMINATED, now - EPUM_RECORD_REAPING_DEFAULT_MAX_AGE + 60)
+        self.state.new_fake_instance_state(
+            "n5", InstanceState.TERMINATED, now - EPUM_RECORD_REAPING_DEFAULT_MAX_AGE + 60)
         self.state.new_fake_instance_state("n6", InstanceState.REJECTED, now - EPUM_RECORD_REAPING_DEFAULT_MAX_AGE + 60)
         self.state.new_fake_instance_state("n7", InstanceState.FAILED, now - EPUM_RECORD_REAPING_DEFAULT_MAX_AGE + 60)
 
@@ -650,3 +732,93 @@ class EPUManagementBasicTests(unittest.TestCase):
         self.assertIn("n5", instances)
         self.assertIn("n6", instances)
         self.assertIn("n7", instances)
+
+    def test_instance_update_conflict_1(self):
+
+        self.epum.initialize()
+        domain_config = self._config_simplest_domainconf(1)
+        definition = {}
+        self.epum.msg_add_domain_definition("definition1", definition)
+        self.epum.msg_add_domain("owner1", "testing123", "definition1", domain_config)
+        self.epum._run_decisions()
+        self.assertEqual(self.provisioner_client.provision_count, 1)
+
+        domain = self.epum_store.get_domain("owner1", "testing123")
+
+        instance_id = self.provisioner_client.launched_instance_ids[0]
+        self.provisioner_client.launches[0]['launch_id']
+
+        sneaky_msg = dict(node_id=instance_id, state=InstanceState.PENDING)
+
+        # patch in a function that sneaks in an instance record update just
+        # before a requested update. This simulates the case where two EPUM
+        # workers are competing to update the same instance.
+        original_new_instance_state = domain.new_instance_state
+
+        patch_called = threading.Event()
+
+        def patched_new_instance_state(content, timestamp=None, previous=None):
+            patch_called.set()
+
+            # unpatch ourself first so we don't recurse forever
+            domain.new_instance_state = original_new_instance_state
+
+            domain.new_instance_state(sneaky_msg, previous=previous)
+            return domain.new_instance_state(content, timestamp=timestamp, previous=previous)
+        domain.new_instance_state = patched_new_instance_state
+
+        # send our "real" update. should get a conflict
+        msg = dict(node_id=instance_id, state=InstanceState.STARTED)
+
+        self.epum.msg_instance_info("owner1", msg)
+
+        assert patch_called.is_set()
+
+        instance = domain.get_instance(instance_id)
+        self.assertEqual(instance.state, InstanceState.STARTED)
+
+    def test_instance_update_conflict_2(self):
+
+        self.epum.initialize()
+        domain_config = self._config_simplest_domainconf(1)
+        definition = {}
+        self.epum.msg_add_domain_definition("definition1", definition)
+        self.epum.msg_add_domain("owner1", "testing123", "definition1", domain_config)
+        self.epum._run_decisions()
+        self.assertEqual(self.provisioner_client.provision_count, 1)
+
+        domain = self.epum_store.get_domain("owner1", "testing123")
+
+        instance_id = self.provisioner_client.launched_instance_ids[0]
+        self.provisioner_client.launches[0]['launch_id']
+
+        sneaky_msg = dict(node_id=instance_id, state=InstanceState.STARTED)
+
+        # patch in a function that sneaks in an instance record update just
+        # before a requested update. This simulates the case where two EPUM
+        # workers are competing to update the same instance.
+        original_new_instance_state = domain.new_instance_state
+
+        patch_called = threading.Event()
+
+        def patched_new_instance_state(content, timestamp=None, previous=None):
+            patch_called.set()
+
+            # unpatch ourself first so we don't recurse forever
+            domain.new_instance_state = original_new_instance_state
+
+            domain.new_instance_state(sneaky_msg, previous=previous)
+            return domain.new_instance_state(content, timestamp=timestamp, previous=previous)
+        domain.new_instance_state = patched_new_instance_state
+
+        # send our "real" update. should get a conflict
+        msg = dict(node_id=instance_id, state=InstanceState.PENDING)
+
+        self.epum.msg_instance_info(None, msg)
+
+        assert patch_called.is_set()
+
+        # in this case the sneaky message (STARTED) should win because it is
+        # the later state
+        instance = domain.get_instance(instance_id)
+        self.assertEqual(instance.state, InstanceState.STARTED)

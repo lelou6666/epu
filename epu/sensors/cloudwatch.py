@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 
 import boto
 
@@ -8,16 +10,17 @@ from epu.exceptions import ProgrammingError
 
 CW_EC2_NAMESPACE = 'AWS/EC2'
 
+
 class CloudWatch(ISensorAggregator):
     """Implementation of CloudWatch sensor aggregator client
 
-    Limited at the moment (You can only query one thing at a time, and 
+    Limited at the moment (You can only query one thing at a time, and
     only by instance id)
     """
 
     def __init__(self, aws_access_key_id, aws_secret_access_key):
 
-        self.cw = boto.connect_cloudwatch(aws_access_key_id=aws_access_key_id, 
+        self.cw = boto.connect_cloudwatch(aws_access_key_id=aws_access_key_id,
                 aws_secret_access_key=aws_secret_access_key)
 
     def get_metric_statistics(self, period, start_time, end_time, metric_name,
@@ -52,7 +55,7 @@ class CloudWatch(ISensorAggregator):
         if not dimensions.get('InstanceId'):
             raise ProgrammingError("You must supply an instance id")
         if (not isinstance(dimensions.get('InstanceId'), basestring) and
-            len(dimensions.get('InstanceId')) > 1):
+                len(dimensions.get('InstanceId')) > 1):
             raise ProgrammingError("You may only supply one instance id")
 
         if not isinstance(statistics, basestring) and len(statistics) > 1:
@@ -80,12 +83,12 @@ class CloudWatch(ISensorAggregator):
             except ZeroDivisionError:
                 metric[Statistics.AVERAGE] = 0.0
         if Statistics.SUM == statistics:
-            metric[Statistics.SUM] = sum(map(float,series))
+            metric[Statistics.SUM] = sum(map(float, series))
         if Statistics.SAMPLE_COUNT == statistics:
             metric[Statistics.SAMPLE_COUNT] = len(series)
         if Statistics.MAXIMUM == statistics:
             metric[Statistics.MAXIMUM] = max(map(float, series))
         if Statistics.MINIMUM == statistics:
             metric[Statistics.MINIMUM] = min(map(float, series))
-    
+
         return instances

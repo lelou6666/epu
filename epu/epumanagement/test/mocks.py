@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import uuid
 import copy
@@ -39,6 +41,7 @@ class MockDomain(object):
     def __init__(self, owner):
         self.owner = owner
 
+
 class MockInstances(object):
 
     def __init__(self, site, deployable_type, extravars=None, state=InstanceState.REQUESTING, sensor_data=None):
@@ -50,6 +53,7 @@ class MockInstances(object):
         self.iaas_id = 'i-' + str(uuid.uuid4()).split('-')[0]
         self.sensor_data = sensor_data
 
+
 class MockState(object):
 
     def __init__(self, instances=None):
@@ -60,6 +64,7 @@ class MockState(object):
 
     def get_unhealthy_instances(self):
         return []
+
 
 class MockControl(object):
 
@@ -82,7 +87,7 @@ class MockControl(object):
         return MockState(self.instances)
 
     def launch(self, dt_name, sites_name, instance_type, extravars=None, caller=None):
-        self._launch_calls  = self._launch_calls + 1
+        self._launch_calls = self._launch_calls + 1
 
         if sites_name not in self.site_launch_calls:
             self.site_launch_calls[sites_name] = 0
@@ -94,7 +99,7 @@ class MockControl(object):
         self.instances.append(instance)
 
         launch_id = str(uuid.uuid4())
-        instance_ids = [instance.instance_id,]
+        instance_ids = [instance.instance_id, ]
         return (launch_id, instance_ids)
 
     def destroy_instances(self, instanceids, caller=None):
@@ -112,7 +117,7 @@ class MockControl(object):
             self.site_launch_calls[i.site] = self.site_launch_calls[i.site] + 1
             i.state = InstanceState.TERMINATING
 
-        self._destroy_calls  = self._destroy_calls + len(instanceids)
+        self._destroy_calls = self._destroy_calls + len(instanceids)
 
     def get_instances(self, site=None, states=None):
         instances = self.instances[:]
@@ -123,6 +128,7 @@ class MockControl(object):
             instances = [i for i in instances if i.state in states]
 
         return instances
+
 
 class MockProvisionerClient(object):
     """See the IProvisionerClient class.
@@ -140,7 +146,7 @@ class MockProvisionerClient(object):
         # circular ref, only in this mock/unit test situation
         self.epum = epum
 
-    def provision(self, launch_id, instance_ids, deployable_type, subscribers,
+    def provision(self, launch_id, instance_ids, deployable_type,
                   site, allocation=None, vars=None, caller=None):
         self.provision_count += 1
         log.debug("provision() count %d", self.provision_count)
@@ -150,19 +156,17 @@ class MockProvisionerClient(object):
 
         record = dict(launch_id=launch_id, dt=deployable_type,
             instance_ids=instance_ids, site=site, allocation=allocation,
-            subscribers=subscribers, vars=vars)
+            vars=vars)
         self.launches.append(record)
 
     def terminate_nodes(self, nodes, caller=None):
         self.terminate_node_count += len(nodes)
         self.terminated_instance_ids.extend(nodes)
-        if self.epum:
-            for node in nodes:
-                content = {"node_id": node, "state": InstanceState.TERMINATING}
-                self.epum.msg_instance_info(None, content)
 
-    def terminate_all(self, rpcwait=False, retries=5, poll=1.0):
-        log.debug("terminate_all()")
+    def report_node_state(self, state, node_id):
+        assert self.epum
+        content = {"node_id": node_id, "state": state}
+        self.epum.msg_instance_info(None, content)
 
     def dump_state(self, nodes, force_subscribe=None):
         log.debug("dump_state()")
@@ -198,6 +202,7 @@ class MockSubscriberNotifier(object):
         self.operations.append(operation)
         self.messages.append(message)
 
+
 class MockOUAgentClient(object):
     """See the IOUAgentClient class
     """
@@ -211,13 +216,14 @@ class MockOUAgentClient(object):
         self.dump_state_called += 1
         if self.epum and self.respond_to_dump_state:
             # In Mock mode, we know that node_id and the OUAgent address are equal things, by convention
-            content = {'node_id':target_address, 'state':InstanceHealthState.OK}
+            content = {'node_id': target_address, 'state': InstanceHealthState.OK}
             self.epum.msg_heartbeat(None, content, timestamp=mock_timestamp)
             self.heartbeats_sent += 1
 
     def _set_epum(self, epum):
         # circular ref, only in this mock/unit test situation
         self.epum = epum
+
 
 class MockDecisionEngine01(Engine):
     """
@@ -240,6 +246,7 @@ class MockDecisionEngine01(Engine):
 
     def reconfigure(self, *args):
         self.reconfigure_count += 1
+
 
 class MockDecisionEngine02(Engine):
     """
@@ -265,6 +272,7 @@ class MockDecisionEngine02(Engine):
         self.reconfigure_count += 1
         raise Exception("reconfigure disturbance")
 
+
 class MockCloudWatch(object):
 
     series_data = [0, ]
@@ -288,7 +296,7 @@ class MockCloudWatch(object):
         else:
             index = instanceid[0]
         try:
-            average = sum(self.series_data)/len(self.series_data)
+            average = sum(self.series_data) / len(self.series_data)
         except ZeroDivisionError:
             average = 0
         metrics[index] = {Statistics.SERIES: self.series_data, Statistics.AVERAGE: average,

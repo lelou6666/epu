@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import os
 
 from nose.plugins.skip import SkipTest
@@ -5,6 +7,7 @@ from datetime import datetime, timedelta
 
 from epu.sensors import Statistics
 from epu.sensors.opentsdb import OpenTSDB
+
 
 class TestRealOpenTSDB(object):
 
@@ -22,7 +25,6 @@ class TestRealOpenTSDB(object):
     def teardown(self):
         pass
 
-    
     def test_get_metric_statistics(self):
 
         period = 60
@@ -30,7 +32,7 @@ class TestRealOpenTSDB(object):
         start_time = end_time - timedelta(minutes=20)
         metric_name = "iostat.disk.write_merged"
         statistics = Statistics.AVERAGE
-        dimensions = {'host': [self.test_host,]}
+        dimensions = {'host': [self.test_host, ]}
 
         result = self.opentsdb.get_metric_statistics(period, start_time,
                 end_time, metric_name, statistics, dimensions)
@@ -60,4 +62,3 @@ class TestRealOpenTSDB(object):
         assert len(result) > 0
         assert result.get(domain)
         assert result[domain].get(Statistics.AVERAGE)
-

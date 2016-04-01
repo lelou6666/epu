@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import os
 import uuid
 import unittest
@@ -45,23 +47,23 @@ phantom-instances:
 """ % (default_user, default_user, default_user, default_password, phantom_port)
 
 fake_credentials = {
-  'access_key': 'xxx',
-  'secret_key': 'xxx',
-  'key_name': 'ooi'
+    'access_key': 'xxx',
+    'secret_key': 'xxx',
+    'key_name': 'ooi'
 }
 
 dt_name = "example"
 example_dt = {
-  'mappings': {
-    'ec2-fake': {
-      'iaas_image': 'ami-fake',
-      'iaas_allocation': 't1.micro',
+    'mappings': {
+        'ec2-fake': {
+            'iaas_image': 'ami-fake',
+            'iaas_allocation': 't1.micro',
+        }
+    },
+    'contextualization': {
+        'method': 'chef-solo',
+        'chef_config': {}
     }
-  },
-  'contextualization': {
-    'method': 'chef-solo',
-    'chef_config': {}
-  }
 }
 
 
@@ -73,23 +75,24 @@ class TestPhantomIntegration(unittest.TestCase, TestFixture):
             raise SkipTest("Slow integration test")
 
         try:
-            from epuharness.harness import EPUHarness
+            from epuharness.harness import EPUHarness  # noqa
         except ImportError:
             raise SkipTest("epuharness not available.")
         try:
-            from epu.mocklibcloud import MockEC2NodeDriver
+            from epu.mocklibcloud import MockEC2NodeDriver  # noqa
         except ImportError:
             raise SkipTest("sqlalchemy not available.")
 
         self.exchange = "testexchange-%s" % str(uuid.uuid4())
+        self.sysname = "testsysname-%s" % str(uuid.uuid4())
         self.user = default_user
 
-        self.epuh_persistence = "/tmp/SupD/epuharness"
+        self.epuh_persistence = os.environ.get('EPUHARNESS_PERSISTENCE_DIR', '/tmp/SupD/epuharness')
         if os.path.exists(self.epuh_persistence):
             raise SkipTest("EPUHarness running. Can't run this test")
 
         # Set up fake libcloud and start deployment
-        self.setup_harness(exchange=self.exchange)
+        self.setup_harness(exchange=self.exchange, sysname=self.sysname)
         self.addCleanup(self.cleanup_harness)
 
         self.epuharness.start(deployment_str=deployment)
@@ -115,4 +118,3 @@ class TestPhantomIntegration(unittest.TestCase, TestFixture):
     def xtest_example(self):
         # Place integration tests here!
         self.phantom_url
-

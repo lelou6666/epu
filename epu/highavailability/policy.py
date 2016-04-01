@@ -1,9 +1,14 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import datetime
+
+from urllib2 import HTTPError
 
 from epu.sensors import Statistics
 from epu.sensors.trafficsentinel import TrafficSentinel
 from epu.states import ProcessState, HAState
+from epu.exceptions import PolicyError
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +41,7 @@ class IPolicy(object):
         smallest_n = None
         smallest_pd = None
         for pd_name, procs in all_procs.iteritems():
-            if smallest_n == None or smallest_n > len(procs):
+            if smallest_n is None or smallest_n > len(procs):
                 smallest_n = len(procs)
                 smallest_pd = pd_name
         return smallest_pd
@@ -100,6 +105,8 @@ class NPreservingPolicy(IPolicy):
     (see __init__) are called to terminate or start VMs.
     """
 
+    _NPRESERVING_PARAMS = ('preserve_n', )
+
     def __init__(self, parameters=None, process_definition_id=None,
             process_configuration=None, schedule_process_callback=None,
             terminate_process_callback=None, process_state_callback=None, **kwargs):
@@ -132,10 +139,10 @@ class NPreservingPolicy(IPolicy):
 
         self._status = HAState.PENDING
 
+        self._parameters = None
         if parameters:
             self.parameters = parameters
         else:
-            self._parameters = None
             self._schedule_kwargs = {}
 
         self.process_definition_id = process_definition_id
@@ -167,17 +174,32 @@ class NPreservingPolicy(IPolicy):
 
     @parameters.setter
     def parameters(self, new_parameters):
+
+        for key in new_parameters.keys():
+            if key not in _SCHEDULE_PROCESS_KWARGS + self._NPRESERVING_PARAMS:
+                raise PolicyError("%s not a valid parameter for npreserving" % key)
+
         try:
-            new_parameters['preserve_n']
+            preserve_n = int(new_parameters['preserve_n'])
+            if preserve_n < 0:
+                raise PolicyError("preserve_n must be greater than 0, you have %s" % new_parameters['preserve_n'])
+            new_parameters['preserve_n'] = preserve_n
+        except ValueError:
+            raise PolicyError("preserve_n must be an integer")
         except TypeError:
-            raise HAPolicyException('parameters must be a dictionary')
+            raise PolicyError("parameters must be a dictionary")
         except KeyError:
-            raise HAPolicyException('parameters must have a preserve_n value')
+            if self._parameters.get('preserve_n') is None and new_parameters.get('preserve_n') is None:
+                raise PolicyError("parameters must have a preserve_n value %s" % new_parameters)
 
         if self._status in (HAState.READY, HAState.STEADY):
             self._status = HAState.READY
 
-        self._parameters = new_parameters
+        if self._parameters is None:
+            self._parameters = {}
+
+        for key, val in new_parameters.iteritems():
+            self._parameters[key] = val
         self._schedule_kwargs = get_schedule_process_kwargs(new_parameters)
 
     def apply_policy(self, all_procs, managed_upids):
@@ -192,8 +214,7 @@ class NPreservingPolicy(IPolicy):
         @param managed_upids: a list of upids that the HA Service is maintaining
         """
         if not self.parameters:
-            log.debug("No policy parameters set. Not applying policy.")
-            return []
+            raise PolicyError("No policy parameters set. Not applying policy.")
 
         managed_upids = self._filter_invalid_processes(all_procs, managed_upids)
 
@@ -204,12 +225,12 @@ class NPreservingPolicy(IPolicy):
             log.info("%sTerminating %d service processes", self.logprefix, to_rebalance)
             for to_rebalance in range(0, to_rebalance):
                 upid = managed_upids[0]
-                terminated = self.terminate_process(upid)
+                self.terminate_process(upid)
         elif to_rebalance > 0:
             log.info("%sScheduling %d service processes", self.logprefix, to_rebalance)
             for to_rebalance in range(0, to_rebalance):
                 pd_name = self._get_least_used_pd(all_procs)
-                new_upid = self.schedule_process(pd_name, self.process_definition_id,
+                self.schedule_process(pd_name, self.process_definition_id,
                     configuration=self.process_configuration,
                     **self._schedule_kwargs)
 
@@ -221,7 +242,6 @@ class NPreservingPolicy(IPolicy):
 
     def _set_status(self, to_rebalance, managed_upids, all_procs):
 
-
         running_upids = []
         for upid in managed_upids:
             if self._process_state(all_procs, upid) == ProcessState.RUNNING:
@@ -231,7 +251,9 @@ class NPreservingPolicy(IPolicy):
             # If already in FAILED state, keep this state.
             # Requires human intervention
             self._status = HAState.FAILED
-        elif to_rebalance == 0 and (len(running_upids) == self.parameters['preserve_n'] or self.parameters['preserve_n'] == 0):
+        elif to_rebalance == 0 and (
+                len(running_upids) == self.parameters['preserve_n'] or
+                self.parameters['preserve_n'] == 0):
             self._status = HAState.STEADY
         elif len(running_upids) >= self.minimum_n and self.parameters['preserve_n'] > 0:
             self._status = HAState.READY
@@ -243,6 +265,10 @@ class NPreservingPolicy(IPolicy):
 
 
 class SensorPolicy(IPolicy):
+
+    _SENSOR_PARAMS = ('metric', 'minimum_processes', 'maximum_processes',
+        'sample_period', 'sample_function', 'cooldown_period', 'scale_up_threshold',
+        'scale_up_n_processes', 'scale_down_threshold', 'scale_down_n_processes')
 
     def __init__(self, parameters=None, process_definition_id=None,
             schedule_process_callback=None, terminate_process_callback=None,
@@ -282,10 +308,10 @@ class SensorPolicy(IPolicy):
         self.terminate_process = terminate_process_callback or dummy_terminate_process_callback
         self.process_state = process_state_callback or dummy_process_state_callback
 
+        self._parameters = None
         if parameters:
             self.parameters = parameters
         else:
-            self._parameters = None
             self._schedule_kwargs = {}
 
         self.process_definition_id = process_definition_id
@@ -322,12 +348,16 @@ class SensorPolicy(IPolicy):
         a dictionary of parameters that looks like:
 
         metric: Name of Sensor Aggregator Metric to use for scaling decisions
-        sample_period: Number of seconds of sample data to use (eg. if 3600, use sample data from 1 hour ago until present time
-        sample_function: Statistical function to apply to sampled data. Choose from Average, Sum, SampleCount, Maximum, Minimum
+        sample_period: Number of seconds of sample data to use (eg. if 3600,
+            use sample data from 1 hour ago until present time
+        sample_function: Statistical function to apply to sampled data. Choose
+            from Average, Sum, SampleCount, Maximum, Minimum
         cooldown_period: Minimum time in seconds between scale up or scale down actions
-        scale_up_threshhold: If the sampled metric is above this value, scale up the number of processes
+        scale_up_threshold: If the sampled metric is above this value, scale
+            up the number of processes
         scale_up_n_processes: Number of processes to scale up by
-        scale_down_threshhold: If the sampled metric is below this value, scale down the number of processes
+        scale_down_threshold: If the sampled metric is below this value,
+            scale down the number of processes
         scale_down_n_processes: Number of processes to scale down by
         minimum_processes: Minimum number of processes to maintain
         maximum_processes: Maximum number of processes to maintain
@@ -338,81 +368,91 @@ class SensorPolicy(IPolicy):
     @parameters.setter
     def parameters(self, new_parameters):
 
-        if new_parameters.get('metric') is None:
-            log.error("metric_name cannot be None")
-            return
+        for key in new_parameters.keys():
+            if key not in _SCHEDULE_PROCESS_KWARGS + self._SENSOR_PARAMS:
+                raise PolicyError("%s not a valid parameter for sensor" % key)
+
+        if self._parameters is None:
+            self._parameters = {}
+        parameters = dict(self._parameters)
+        for key, val in new_parameters.iteritems():
+            parameters[key] = val
+
+        if parameters.get('metric') is None:
+            msg = "a metric_name must be provided"
+            raise PolicyError(msg)
 
         try:
-            sample = int(new_parameters.get('sample_period'))
-            if sample < 0:
+            parameters['sample_period'] = int(parameters.get('sample_period'))
+            if parameters['sample_period'] < 0:
                 raise ValueError()
         except ValueError:
-            log.error("sample_period '%s' is not a positive integer" % (
-                new_parameters.get('sample_period')))
+            msg = "sample_period '%s' is not a positive integer" % (
+                parameters.get('sample_period'))
+            raise PolicyError(msg)
 
-        if new_parameters.get('sample_function') not in Statistics.ALL:
-            log.error("'%s' is not a known sample_function. Choose from %s" % (
-                new_parameters.get('sample_function'), Statistics.ALL))
-            return
+        if parameters.get('sample_function') not in Statistics.ALL:
+            msg = "'%s' is not a known sample_function. Choose from %s" % (
+                parameters.get('sample_function'), Statistics.ALL)
+            raise PolicyError(msg)
 
         try:
-            cool = int(new_parameters.get('cooldown_period'))
-            if cool < 0:
+            parameters['cooldown_period'] = int(parameters.get('cooldown_period'))
+            if parameters['cooldown_period'] < 0:
                 raise ValueError()
         except ValueError:
-            log.error("cooldown_period '%s' is not a positive integer" % (
-                new_parameters.get('cooldown_period')))
-            return
+            msg = "cooldown_period '%s' is not a positive integer" % (
+                parameters.get('cooldown_period'))
+            raise PolicyError(msg)
 
         try:
-            float(new_parameters.get('scale_up_threshold'))
+            parameters['scale_up_threshold'] = float(parameters.get('scale_up_threshold'))
         except ValueError:
-            log.error("scale_up_threshold '%s' is not a floating point number" % (
-                new_parameters.get('scale_up_threshold')))
-            return
+            msg = "scale_up_threshold '%s' is not a floating point number" % (
+                parameters.get('scale_up_threshold'))
+            raise PolicyError(msg)
 
         try:
-            int(new_parameters.get('scale_up_n_processes'))
+            parameters['scale_up_n_processes'] = int(parameters.get('scale_up_n_processes'))
         except ValueError:
-            log.error("scale_up_n_processes '%s' is not an integer" % (
-                new_parameters.get('scale_up_n_processes')))
-            return
+            msg = "scale_up_n_processes '%s' is not an integer" % (
+                parameters.get('scale_up_n_processes'))
+            raise PolicyError(msg)
 
         try:
-            float(new_parameters.get('scale_down_threshold'))
+            parameters['scale_down_threshold'] = float(parameters.get('scale_down_threshold'))
         except ValueError:
-            log.error("scale_down_threshold '%s' is not a floating point number" % (
-                new_parameters.get('scale_down_threshold')))
-            return
+            msg = "scale_down_threshold '%s' is not a floating point number" % (
+                parameters.get('scale_down_threshold'))
+            raise PolicyError(msg)
 
         try:
-            int(new_parameters.get('scale_down_n_processes'))
+            parameters['scale_down_n_processes'] = int(parameters.get('scale_down_n_processes'))
         except ValueError:
-            log.error("scale_down_n_processes '%s' is not an integer" % (
-                new_parameters.get('scale_up_n_processes')))
-            return
+            msg = "scale_down_n_processes '%s' is not an integer" % (
+                parameters.get('scale_up_n_processes'))
+            raise PolicyError(msg)
 
         try:
-            minimum_processes = int(new_parameters.get('minimum_processes'))
-            if minimum_processes < 0:
+            parameters['minimum_processes'] = int(parameters.get('minimum_processes'))
+            if parameters['minimum_processes'] < 0:
                 raise ValueError()
         except ValueError:
-            log.error("minimum_processes '%s' is not a positive integer" % (
-                new_parameters.get('minimum_processes')))
-            return
+            msg = "minimum_processes '%s' is not a positive integer" % (
+                parameters.get('minimum_processes'))
+            raise PolicyError(msg)
 
         try:
-            maximum_processes = int(new_parameters.get('maximum_processes'))
-            if maximum_processes < 0:
+            parameters['maximum_processes'] = int(parameters.get('maximum_processes'))
+            if parameters['maximum_processes'] < 0:
                 raise ValueError()
         except ValueError:
-            log.error("maximum_processes '%s' is not a positive integer" % (
-                new_parameters.get('maximum_processes')))
-            return
+            msg = "maximum_processes '%s' is not a positive integer" % (
+                parameters.get('maximum_processes'))
+            raise PolicyError(msg)
 
         # phew!
-        self._parameters = new_parameters
-
+        self._parameters = parameters
         self._schedule_kwargs = get_schedule_process_kwargs(new_parameters)
 
     def status(self):
@@ -421,8 +461,7 @@ class SensorPolicy(IPolicy):
     def apply_policy(self, all_procs, managed_upids):
 
         if self._parameters is None:
-            log.debug("No parameters set, unable to apply policy")
-            return []
+            raise PolicyError("No parameters set, unable to apply policy")
 
         time_since_last_scale = datetime.datetime.now() - self.last_scale_action
         if time_since_last_scale.seconds < self._parameters['cooldown_period']:
@@ -430,32 +469,12 @@ class SensorPolicy(IPolicy):
             self._set_status(0, managed_upids)
             return managed_upids
 
-        # Check for missing upids (From a dead pd for example)
-        all_upids = self._extract_upids_from_all_procs(all_procs)
-        for upid in managed_upids:
-            if upid not in all_upids:
-                # Process is missing! Remove from managed_upids
-                managed_upids.remove(upid)
-
-        # Check for terminated procs
-        for pd, procs in all_procs.iteritems():
-            for proc in procs:
-
-                if proc['upid'] not in managed_upids:
-                    continue
-
-                if proc.get('state') is None:
-                    # Pyon procs may have no state
-                    continue
-
-                state = proc['state']
-                if state > ProcessState.RUNNING:  # if terminating or exited, etc
-                    managed_upids.remove(proc['upid'])
+        managed_upids = self._filter_invalid_processes(all_procs, managed_upids)
 
         # Get numbers from metric
         hostnames = self._get_hostnames(all_procs, managed_upids)
         period = 60
-        end_time = datetime.datetime.now() # TODO: what TZ does TS use?
+        end_time = datetime.datetime.now()  # TODO: what TZ does TS use?
         seconds = self._parameters['sample_period']
         start_time = end_time - datetime.timedelta(seconds=seconds)
         metric_name = self._parameters['metric']
@@ -468,10 +487,11 @@ class SensorPolicy(IPolicy):
             dimensions = {'hostname': hostnames}
         try:
             metric_per_host = self._sensor_aggregator.get_metric_statistics(
-                    period, start_time, end_time, metric_name, statistics, dimensions)
-        except Exception as e:
-            log.exception("Problem getting metrics from sensor aggregator")
-            return
+                period, start_time, end_time, metric_name, statistics, dimensions)
+        except HTTPError as h:
+            msg = "Problem getting metrics from sensor aggregator with url: '%s'" % h.filename
+            log.exception(msg)
+            raise PolicyError(msg)
 
         values = []
         for host, metric_value in metric_per_host.iteritems():
@@ -482,38 +502,34 @@ class SensorPolicy(IPolicy):
         try:
             average_metric = sum(values) / len(values)
         except ZeroDivisionError:
+            # TODO: this is really boneheaded. What we should do instead is
+            # treat this situation specifically to scale to the minimum.
+            # Users might want a metric that can go negative for example,
+            # and this trick won't work
             average_metric = 0
+
         if average_metric > self._parameters['scale_up_threshold']:
             scale_by = self._parameters['scale_up_n_processes']
-
-            if len(managed_upids) - scale_by > self._parameters['maximum_processes']:
-                scale_by = self._parameters['maximum_processes'] - len(managed_upids)
-
         elif average_metric < self._parameters['scale_down_threshold']:
             scale_by = - abs(self._parameters['scale_down_n_processes'])
-
-            if len(managed_upids) + scale_by < self._parameters['minimum_processes']:
-                scale_by = self._parameters['minimum_processes'] - len(managed_upids)
         else:
             scale_by = 0
 
-        if scale_by == 0:
-            if len(managed_upids) < self._parameters['minimum_processes']:
-                scale_by = self._parameters['scale_up_n_processes']
-            elif len(managed_upids) > self._parameters['maximum_processes']:
-                scale_by = - abs(self._parameters['scale_down_n_processes'])
+        wanted = len(managed_upids) + scale_by
+        wanted = min(max(wanted, self._parameters['minimum_processes']), self._parameters['maximum_processes'])
+        scale_by = wanted - len(managed_upids)
 
         if scale_by < 0:  # remove excess
             log.info("%sSensor policy scaling down by %s", self.logprefix, scale_by)
             scale_by = -1 * scale_by
             for to_scale in range(0, scale_by):
                 upid = managed_upids[0]
-                terminated = self.terminate_process(upid)
+                self.terminate_process(upid)
         elif scale_by > 0:  # Add processes
             log.info("%sSensor policy scaling up by %s", self.logprefix, scale_by)
             for to_rebalance in range(0, scale_by):
                 pd_name = self._get_least_used_pd(all_procs)
-                new_upid = self.schedule_process(pd_name, self.process_definition_id,
+                self.schedule_process(pd_name, self.process_definition_id,
                     **self._schedule_kwargs)
 
         if scale_by != 0:
@@ -558,19 +574,17 @@ class SensorPolicy(IPolicy):
         return list(set(hostnames))
 
 policy_map = {
-        'npreserving': NPreservingPolicy,
-        'sensor': SensorPolicy,
+    'npreserving': NPreservingPolicy,
+    'sensor': SensorPolicy,
 }
 
 _SCHEDULE_PROCESS_KWARGS = ('node_exclusive', 'execution_engine_id',
                             'constraints', 'queueing_mode', 'restart_mode')
+
+
 def get_schedule_process_kwargs(parameters):
     kwargs = {}
     for k in _SCHEDULE_PROCESS_KWARGS:
         if k in parameters:
             kwargs[k] = parameters[k]
     return kwargs
-
-
-class HAPolicyException(BaseException):
-    pass

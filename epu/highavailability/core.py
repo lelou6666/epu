@@ -1,7 +1,10 @@
+# Copyright 2013 University of Chicago
+
 
 import logging
 
-from epu.exceptions import ProgrammingError
+from epu.exceptions import ProgrammingError, PolicyError
+from epu.highavailability.policy import policy_map
 
 log = logging.getLogger(__name__)
 
@@ -27,7 +30,7 @@ class HighAvailabilityCore(object):
     """Core of High Availability Service
     """
 
-    def __init__(self, CFG, control, process_dispatchers, Policy,
+    def __init__(self, CFG, control, process_dispatchers, policy,
             process_definition_id=None, process_configuration=None,
             parameters=None, aggregator_config=None, name=None):
         """Create HighAvailabilityCore
@@ -39,12 +42,13 @@ class HighAvailabilityCore(object):
 
         self.CFG = CFG
         self.control = control
+        self.policy_type = None
         self.process_dispatchers = process_dispatchers
         self.process_configuration = process_configuration
-        self.policy_params = parameters
         self.aggregator_config = aggregator_config
-        if name:
-            self.logprefix = "HA Agent (%s): " % name
+        self.name = name
+        if self.name:
+            self.logprefix = "HA Agent (%s): " % self.name
         else:
             self.logprefix = ""
 
@@ -52,13 +56,7 @@ class HighAvailabilityCore(object):
             raise ProgrammingError("You must have a process_definition_id")
         self.process_definition_id = process_definition_id
 
-        self.policy = Policy(parameters=self.policy_params,
-                schedule_process_callback=self._schedule,
-                terminate_process_callback=self._terminate_upid,
-                process_state_callback=self._process_state,
-                process_definition_id=self.process_definition_id,
-                process_configuration=self.process_configuration,
-                aggregator_config=self.aggregator_config, name=name)
+        self.reconfigure_policy(parameters, policy)
         self.managed_upids = []
 
     def apply_policy(self):
@@ -68,7 +66,12 @@ class HighAvailabilityCore(object):
         log.debug("%sapplying policy", self.logprefix)
 
         all_procs = self.control.get_all_processes()
-        self.managed_upids = list(self.policy.apply_policy(all_procs, self.managed_upids))
+        try:
+            managed_upids = self.policy.apply_policy(all_procs, self.managed_upids)
+            if isinstance(managed_upids, (tuple, list)):
+                self.managed_upids = managed_upids
+        except PolicyError:
+            log.exception("Couldn't apply policy because of an error")
 
     def set_managed_upids(self, upids):
         """Called to override the managed process set, for HAAgent restart
@@ -123,16 +126,29 @@ class HighAvailabilityCore(object):
         """
         return self.policy.status()
 
-    def reconfigure_policy(self, new_policy):
-        """Change the number of needed instances of service
+    def reconfigure_policy(self, new_policy_params, new_policy=None):
+        """Reconfigure the policy of this ha service
         """
-        self.policy_params = new_policy
-        self.policy.parameters = new_policy
+        if new_policy is not None and new_policy != self.policy_type:
+            Policy = policy_map.get(new_policy)
+            if Policy is None:
+                raise PolicyError("HA doesn't know how to use %s policy" % new_policy)
+            self.policy = Policy(parameters=new_policy_params,
+                    schedule_process_callback=self._schedule,
+                    terminate_process_callback=self._terminate_upid,
+                    process_state_callback=self._process_state,
+                    process_definition_id=self.process_definition_id,
+                    process_configuration=self.process_configuration,
+                    aggregator_config=self.aggregator_config, name=self.name)
+            self.policy_type = new_policy
+        elif new_policy_params is not None:
+            self.policy.parameters = new_policy_params
 
     def dump(self):
 
         state = {}
-        state['policy'] = self.policy_params
+        state['policy'] = self.policy_type
+        state['policy_params'] = self.policy.parameters
         state['managed_upids'] = self.managed_upids
 
         return state

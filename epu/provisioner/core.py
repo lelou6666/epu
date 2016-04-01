@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+# Copyright 2013 University of Chicago
 
 """
 @file epu/provisioner/core.py
@@ -15,15 +15,20 @@ from libcloud.compute.types import NodeState as LibcloudNodeState
 from libcloud.compute.base import Node as LibcloudNode
 from libcloud.compute.base import NodeImage as LibcloudNodeImage
 from libcloud.compute.base import NodeSize as LibcloudNodeSize
-
+try:
+    from statsd import StatsClient
+except ImportError:
+    StatsClient = None
 
 from epu.provisioner.ctx import ContextClient, BrokerError, BrokerAuthError,\
     ContextNotFoundError, NimbusClusterDocument, ValidationError
+from epu.provisioner import chefutil
 from epu.provisioner.sites import SiteDriver
 from epu.provisioner.store import group_records, sanitize_record, VERSION_KEY
 from epu.exceptions import DeployableTypeLookupError, DeployableTypeValidationError
 from epu.states import InstanceState
-from epu.exceptions import WriteConflictError, UserNotPermittedError, GeneralIaaSException
+from epu.exceptions import WriteConflictError, UserNotPermittedError,\
+    GeneralIaaSException, IaaSIsFullException, NotFoundError
 from epu import cei_events
 from epu.util import check_user
 from epu.domain_log import EpuLoggerThreadSpecific
@@ -37,20 +42,28 @@ states = InstanceState
 __all__ = ['ProvisionerCore', 'ProvisioningError']
 
 _LIBCLOUD_STATE_MAP = {
-        LibcloudNodeState.RUNNING : states.STARTED,
-        LibcloudNodeState.REBOOTING : states.STARTED, #TODO hmm
-        LibcloudNodeState.PENDING : states.PENDING,
-        LibcloudNodeState.TERMINATED : states.TERMINATED,
-        LibcloudNodeState.UNKNOWN : states.ERROR_RETRYING}
+    LibcloudNodeState.RUNNING: states.STARTED,
+    LibcloudNodeState.REBOOTING: states.STARTED,  # TODO hmm
+    LibcloudNodeState.PENDING: states.PENDING,
+    LibcloudNodeState.TERMINATED: states.TERMINATED,
+    LibcloudNodeState.UNKNOWN: states.ERROR_RETRYING}
 
-# Window of time in which nodes are allowed to be launched
+# A window of time in which nodes can have been launched
 # but not returned in queries to the IaaS. After this, nodes
 # are assumed to be terminated out of band and marked FAILED
 _IAAS_NODE_QUERY_WINDOW_SECONDS = 60
 
 # If a node has been started for more than INSTANCE_READY_TIMEOUT and has not
 # checked in with the context broker, its state is changed to RUNNING_FAILED.
-INSTANCE_READY_TIMEOUT = 90
+INSTANCE_READY_TIMEOUT = 240
+
+
+# Amount of time to wait to confirm that a node is a zombie (it could just not
+# be in the store yet)
+_POTENTIAL_ZOMBIE_QUERY_WINDOW_SECONDS = 10
+
+EPU_CLIENT_TOKEN_PREFIX = "__EPU_PROVISIONER_"
+
 
 class ProvisionerCore(object):
     """Provisioner functionality that is not specific to the service.
@@ -59,7 +72,10 @@ class ProvisionerCore(object):
     # Maximum time that any IaaS query can take before throwing a timeout exception
     _IAAS_DEFAULT_TIMEOUT = 60
 
-    def __init__(self, store, notifier, dtrs, context, logger=None, iaas_timeout=None):
+    UNKNOWN_LAUNCH_ID = "provisioner-unknown-launch"
+
+    def __init__(self, store, notifier, dtrs, context, logger=None, iaas_timeout=None, statsd_cfg=None,
+            instance_ready_timeout=None):
         """
 
         @type store: ProvisionerStore
@@ -72,6 +88,7 @@ class ProvisionerCore(object):
         self.store = store
         self.notifier = notifier
         self.dtrs = dtrs
+        self._potential_zombie_nodes = {}
 
         self.context = context
 
@@ -80,62 +97,52 @@ class ProvisionerCore(object):
         else:
             self.iaas_timeout = self._IAAS_DEFAULT_TIMEOUT
 
+        if instance_ready_timeout is not None:
+            self.instance_ready_timeout = instance_ready_timeout
+        else:
+            self.instance_ready_timeout = INSTANCE_READY_TIMEOUT
+
+        self.statsd_client = None
+        if statsd_cfg is not None:
+            try:
+                host = statsd_cfg["host"]
+                port = statsd_cfg["port"]
+                log.info("Setting up statsd client with host %s and port %d" % (host, port))
+                self.statsd_client = StatsClient(host, port)
+            except:
+                log.exception("Failed to set up statsd client")
+
         if not context:
             log.warn("No context client provided. Contextualization disabled.")
 
-    def recover(self):
-        """Finishes any incomplete launches or terminations
-        """
-        incomplete_launches = self.store.get_launches(
-                state=states.REQUESTED)
-        for launch in incomplete_launches:
-            nodes = self._get_nodes_by_id(launch['node_ids'])
-
-            log.info('Attempting recovery of incomplete launch: %s',
-                     launch['launch_id'])
-            log.info('Launch creator is %s', launch['creator'])
-            self.execute_provision(launch, nodes, launch['creator'])
-
-        terminating_nodes = self.store.get_nodes(
-                state=states.TERMINATING)
-        if terminating_nodes:
-            node_ids = [node['node_id'] for node in terminating_nodes]
-            log.info('Attempting recovery of incomplete node terminations: %s',
-                         ','.join(node_ids))
-            self.terminate_nodes(node_ids, remove_terminating=False)
-
     def _validation_error(self, msg, *args):
-        log.debug("raising provisioning validation error: "+ msg, *args)
+        log.debug("raising provisioning validation error: " + msg, *args)
         raise ProvisioningError("Invalid provision request: " + msg % args)
 
     def prepare_provision(self, launch_id, deployable_type, instance_ids,
-                          subscribers, site, allocation=None, vars=None, caller=None):
-        #wrapper for logging
+                          site, allocation=None, vars=None, caller=None):
+        # wrapper for logging
 
         """Validates request and commits to datastore.
 
-        If the request has subscribers, they are notified with the
-        node state records.
-
-        If the request is invalid and doesn't contain enough information
+            If the request is invalid and doesn't contain enough information
         to notify subscribers via normal channels, a ProvisioningError
         is raised. This is almost certainly a client programming error.
-
-        If the request is well-formed but invalid, for example if the
-        deployable type does not exist in the DTRS, FAILED records are
+            If the request is well-formed but invalid, for example if the
+        deployable type does not exist in the DTRS, then FAILED records are
         recorded in data store and subscribers are notified.
-
-        Returns a tuple (launch record, node records). It is the caller's
+            Returns a tuple (launch record, node records). It is the caller's
         responsibility to check the launch record for a FAILED state
         before proceeding with launch.
         """
         with EpuLoggerThreadSpecific(user=caller):
-            return self._prepare_provision(launch_id, deployable_type,
-                instance_ids, subscribers, site, allocation=allocation,
+            return self._prepare_provision(
+                launch_id, deployable_type,
+                instance_ids, site, allocation=allocation,
                 vars=vars, caller=caller)
 
     def _prepare_provision(self, launch_id, deployable_type, instance_ids,
-                          subscribers, site, allocation=None, vars=None, caller=None):
+                           site, allocation=None, vars=None, caller=None):
         # initial validation
         if not launch_id:
             self._validation_error("bad launch_id '%s'", launch_id)
@@ -143,14 +150,11 @@ class ProvisionerCore(object):
         if not deployable_type:
             self._validation_error("bad deployable_type '%s'", deployable_type)
 
-        if not (isinstance(instance_ids, (list,tuple)) and
+        if not (isinstance(instance_ids, (list, tuple)) and
                 len(instance_ids) == 1 and instance_ids[0]):
             self._validation_error(
-                "bad instance_ids '%s': need a list or tuple of length 1 -- "+
+                "bad instance_ids '%s': need a list or tuple of length 1 -- " +
                 "multi-node launches are not supported yet.", instance_ids)
-
-        if not isinstance(subscribers, (list,tuple)):
-            self._validation_error("bad subscribers '%s'", subscribers)
 
         if not site:
             self._validation_error("invalid site: '%s'", site)
@@ -158,10 +162,9 @@ class ProvisionerCore(object):
         if not caller:
             log.debug("No caller specified. Not restricting access to this launch")
 
-        #validate nodes and build DTRS request
+        # validate nodes and build DTRS request
         dtrs_request_node = dict(count=len(instance_ids), site=site,
-            allocation=allocation)
-
+                                 allocation=allocation)
         # from this point on, errors result in failure records, not exceptions.
         # except for, you know, bugs.
         state = states.REQUESTED
@@ -170,17 +173,17 @@ class ProvisionerCore(object):
             dt = self.dtrs.lookup(caller, deployable_type, dtrs_request_node, vars)
             document = dt['document']
             dtrs_node = dt['node']
-            log.debug('got dtrs node: ' + str(dtrs_node))
+            log.debug("Got DTRS node: " + str(dtrs_node))
         except DeployableTypeLookupError, e:
-            log.error('Failed to lookup deployable type "%s" in DTRS: %s',
-                    deployable_type, str(e))
+            log.error("Failed to lookup deployable type '%s' in DTRS: %s",
+                      deployable_type, str(e))
             state = states.FAILED
             state_description = "DTRS_LOOKUP_FAILED " + str(e)
             document = "N/A"
             dtrs_node = None
         except DeployableTypeValidationError, e:
-            log.error('Failed to validate deployable type "%s" in DTRS: %s',
-                    deployable_type, str(e))
+            log.error("Failed to validate deployable type '%s' in DTRS: %s",
+                      deployable_type, str(e))
             state = states.FAILED
             state_description = "DTRS_VALIDATION_FAILED " + str(e)
             document = "N/A"
@@ -191,41 +194,42 @@ class ProvisionerCore(object):
             state_description = "PROVISIONER_DISABLED"
 
         context = None
-        try:
-            # don't try to create a context when contextualization is disabled
-            # or when userdata is passed through directly
-            if self.context and dtrs_node is not None and not dtrs_node.get('iaas_userdata') and state == states.REQUESTED:
+        needs_nimbus_ctx = False
+        if dtrs_node is not None:
+            needs_nimbus_ctx = bool(dtrs_node.get('needs_nimbus_ctx'))
 
+        if needs_nimbus_ctx and self.context and state == states.REQUESTED:
+            try:
                 context = self.context.create()
-                log.debug('Created new context: ' + context.uri)
-        except BrokerError, e:
-            log.warn('Error while creating new context for launch: %s', e)
-            state = states.FAILED
-            state_description = "CONTEXT_CREATE_FAILED " + str(e)
+                log.debug("Created new context: " + context.uri)
+            except BrokerError, e:
+                log.warn("Error while creating new context for launch: %s", e)
+                state = states.FAILED
+                state_description = "CONTEXT_CREATE_FAILED " + str(e)
 
         launch_record = {
-                'launch_id' : launch_id,
-                'document' : document,
-                'deployable_type' : deployable_type,
-                'context' : context,
-                'subscribers' : subscribers,
-                'state' : state,
-                'node_ids' : list(instance_ids),
-                'creator' : caller,
-                }
+            'launch_id': launch_id,
+            'document': document,
+            'deployable_type': deployable_type,
+            'context': context,
+            'state': state,
+            'node_ids': list(instance_ids),
+            'creator': caller,
+        }
 
         node_records = []
         for node_id in instance_ids:
-            record = {'launch_id' : launch_id,
-                    'node_id' : node_id,
-                    'state' : state,
-                    'state_desc' : state_description,
-                    'site' : site,
-                    'allocation' : allocation,
-                    'client_token' : launch_id,
-                    'creator' : caller,
-                    }
-            #DTRS returns a bunch of IaaS specific info:
+            record = {
+                'launch_id': launch_id,
+                'node_id': node_id,
+                'state': state,
+                'state_desc': state_description,
+                'site': site,
+                'allocation': allocation,
+                'client_token': "%s%s" % (EPU_CLIENT_TOKEN_PREFIX, launch_id),
+                'creator': caller,
+            }
+            # DTRS returns a bunch of IaaS specific info:
             # ssh key name, "real" allocation name, etc.
             # we fold it in blindly
             if dtrs_node:
@@ -238,7 +242,7 @@ class ProvisionerCore(object):
             self.store.add_launch(launch_record)
         except WriteConflictError:
             log.debug("record for launch %s already exists, proceeding.",
-                launch_id)
+                      launch_id)
             launch_record = self.store.get_launch(launch_id)
 
         for index, node in enumerate(node_records):
@@ -246,13 +250,12 @@ class ProvisionerCore(object):
                 self.store.add_node(node)
             except WriteConflictError:
                 log.debug("record for node %s already exists, proceeding.",
-                    node['node_id'])
+                          node['node_id'])
                 node_records[index] = self.store.get_node(node['node_id'])
 
-        self.notifier.send_records(node_records, subscribers)
+        self.notifier.send_records(node_records)
         return launch_record, node_records
 
-    # XX log here
     def execute_provision(self, launch, nodes, caller):
         """Brings a launch to the PENDING state.
 
@@ -270,23 +273,19 @@ class ProvisionerCore(object):
             if self.store.is_disabled():
                 error_state = states.REJECTED
                 error_description = "PROVISIONER_DISABLED"
-                log.error('Provisioner is DISABLED. Rejecting provision request!')
-
+                log.error("Provisioner is DISABLED. Rejecting provision request!")
             else:
-
                 self._really_execute_provision_request(launch, nodes, caller)
-
         except ProvisioningError, e:
-            log.error('Failed to execute launch. Problem: ' + str(e))
+            log.error("Failed to execute launch. Problem: " + str(e))
             error_state = states.FAILED
             error_description = e.message
-
-        except Exception, e: # catch all exceptions, need to ensure nodes are marked FAILED
-            log.error('Launch failed due to an unexpected error. '+
-                    'This is likely a bug and should be reported. Problem: ' +
-                    str(e), exc_info=True)
+        except Exception, e:  # catch all exceptions, need to ensure nodes are marked FAILED
+            log.error("Launch failed due to an unexpected error. " +
+                      "This is likely a bug and should be reported. Problem: " +
+                      str(e), exc_info=True)
             error_state = states.FAILED
-            error_description = 'PROGRAMMER_ERROR '+str(e)
+            error_description = 'PROGRAMMER_ERROR ' + str(e)
 
         if error_state:
             for node in nodes:
@@ -297,34 +296,33 @@ class ProvisionerCore(object):
                     add_state_change(node, error_state)
                     node['state_desc'] = error_description
 
-            #store and notify launch and nodes with FAILED states
-            self.maybe_update_launch_state(launch, error_state,
+            # store and notify launch and nodes with FAILED states
+            self.maybe_update_launch_state(
+                launch, error_state,
                 state_desc=error_description)
-            self.store_and_notify(nodes, launch['subscribers'])
+            self.store_and_notify(nodes)
 
     def _really_execute_provision_request(self, launch, nodes, caller):
         """Brings a launch to the PENDING state.
         """
-        subscribers = launch['subscribers']
         docstr = launch['document']
         context = launch['context']
 
         try:
             doc = NimbusClusterDocument(docstr)
         except ValidationError, e:
-            raise ProvisioningError('CONTEXT_DOC_INVALID '+str(e))
-
+            raise ProvisioningError("CONTEXT_DOC_INVALID " + str(e))
         # HACK: sneak in and disable contextualization for the node if we
         # are not using it. Nimboss should really be restructured to better
         # support this.
-        if not self.context or nodes[0].get('iaas_userdata'):
+        if not (self.context and nodes[0].get('needs_nimbus_ctx')):
             for member in doc.members:
                 member.needs_contextualization = False
 
         specs = doc.build_specs(context)
         if not (specs and len(specs) == 1):
             raise ProvisioningError(
-                'INVALID_REQUEST expected exactly one workspace in cluster doc')
+                "INVALID_REQUEST expected exactly one workspace in cluster doc")
         spec = specs[0]
 
         # we want to fail early, before we launch anything if possible
@@ -335,25 +333,31 @@ class ProvisionerCore(object):
 
         # for recovery case
         if not any(node['state'] < states.PENDING for node in nodes):
-            log.info('Skipping IaaS launch %s -- all nodes started',
+            log.info("Skipping IaaS launch %s -- all nodes started",
                      spec.name)
 
         else:
             newstate = None
+
             try:
                 log.info("Launching group:\nlaunch_spec: '%s'\nlaunch_nodes: '%s'",
                          spec, nodes)
                 self._launch_one_group(spec, nodes, caller=caller)
-
-            except GeneralIaaSException,gie:
-                log.exception('Problem launching group %s: %s',
-                        spec.name, str(gie))
+            except IaaSIsFullException, iif:
+                log.warning("Problem launching group %s: %s",
+                            spec.name, str(iif))
+                newstate = states.FAILED
+                has_failed = True
+                failure_message = "IAAS_FULL: " + str(iif)
+            except GeneralIaaSException, gie:
+                log.exception("Problem launching group %s: %s",
+                              spec.name, str(gie))
                 newstate = states.FAILED
                 has_failed = True
                 failure_message = str(gie)
-            except Exception,e:
-                log.exception('Problem launching group %s: %s',
-                        spec.name, str(e))
+            except Exception, e:
+                log.exception("Problem launching group %s: %s",
+                              spec.name, str(e))
                 newstate = states.FAILED
                 has_failed = True
                 failure_message = str(e)
@@ -364,7 +368,7 @@ class ProvisionerCore(object):
                     if failure_message:
                         node['state_desc'] = failure_message
                     add_state_change(node, newstate)
-            self.store_and_notify(nodes, subscribers)
+            self.store_and_notify(nodes)
 
         if has_failed:
             newstate = states.FAILED
@@ -376,7 +380,7 @@ class ProvisionerCore(object):
     def _validate_launch(self, nodes, spec):
         if spec.count != len(nodes):
             raise ProvisioningError(
-                'INVALID_REQUEST node group '+
+                'INVALID_REQUEST node group ' +
                 '%s specifies %s nodes but cluster document has %s' %
                 (spec.name, len(nodes), spec.count))
 
@@ -384,8 +388,8 @@ class ProvisionerCore(object):
         """Launches a single group: a single IaaS request.
         """
 
-        #assumption here is that a launch group does not span sites or
-        #allocations. That may be a feature for later.
+        # assumption here is that a launch group does not span sites or
+        # allocations. That may be a feature for later.
 
         one_node = nodes[0]
         site_name = one_node['site']
@@ -394,42 +398,84 @@ class ProvisionerCore(object):
             raise ProvisioningError("Called with bad caller %s" % caller)
 
         # Get the site description from DTRS
-        site_description = self.dtrs.describe_site(site_name)
+        site_description = self.dtrs.describe_site(site_name, caller=caller)
         if not site_description:
             raise ProvisioningError("Site description not found for %s" % site_name)
+
+        needs_elastic_ip = bool(site_description.get('needs_elastic_ip', False))
 
         # Get the credentials from DTRS
         credentials_description = self.dtrs.describe_credentials(caller, site_name)
         if not credentials_description:
             raise ProvisioningError("Credentials description not found for %s" % site_name)
 
-        #set some extras in the spec
-        allocstring = "default"
+        # set some extras in the spec
+        allocstring = 'default'
         allocation = one_node.get('iaas_allocation')
         if allocation:
             spec.size = allocation
             allocstring = str(allocation)
-        keystring = "default"
+        keystring = 'default'
         sshkeyname = one_node.get('iaas_sshkeyname')
         if sshkeyname:
             spec.keyname = sshkeyname
             keystring = str(sshkeyname)
-        userdata = one_node.get('iaas_userdata')
-        if userdata:
-            spec.userdata = userdata
 
+        ctx_method = one_node.get('ctx_method')
+        if ctx_method == 'userdata':
+            userdata = one_node.get('iaas_userdata')
+            if userdata:
+                spec.userdata = userdata
+
+        elif ctx_method == 'chef':
+            attributes = one_node['chef_attributes']
+            runlist = one_node['chef_runlist']
+
+            # TODO remove hardcoded credentials name
+            credential_name = one_node.get('chef_credential')
+            if not credential_name:
+                raise ProvisioningError("Node has chef ctx_method but no chef_credential")
+            chef_credentials = self.dtrs.describe_credentials(caller, credential_name,
+                credential_type="chef")
+            if not chef_credentials:
+                raise ProvisioningError("Chef credentials '%s' not found" % credential_name)
+
+            server_url = chef_credentials['url']
+            chef_node = chefutil.get_chef_node(one_node['node_id'], server_url,
+                                               chef_credentials['client_key'],
+                                               chef_credentials.get('client_name'))
+            if chef_node is not None:
+                    log.warn("Chef node %s already exists in server %s",
+                             one_node['node_id'], server_url)
+
+            spec.userdata = chefutil.get_chef_cloudinit_userdata(one_node['node_id'],
+                server_url, chef_credentials['validator_key'], runlist, attributes,
+                chef_credentials.get('validation_client_name'))
         client_token = one_node.get('client_token')
 
-        log.debug('Launching group %s - %s nodes (keypair=%s) (allocation=%s)',
-                spec.name, spec.count, keystring, allocstring)
+        log.debug("Launching group %s - %s nodes (keypair=%s) (allocation=%s)",
+                  spec.name, spec.count, keystring, allocstring)
 
         try:
             driver = SiteDriver(site_description, credentials_description, timeout=self.iaas_timeout)
             try:
-                iaas_nodes = self._launch_node_spec(spec, driver.driver,
-                    ex_clienttoken=client_token)
+                before = time.time()
+                iaas_nodes = self._launch_node_spec(
+                    spec, driver.driver,
+                    ex_clienttoken=client_token,
+                    needs_elastic_ip=needs_elastic_ip)
+                after = time.time()
+                if self.statsd_client is not None:
+                    try:
+                        self.statsd_client.timing('provisioner.run_instances.timing', (after - before) * 1000)
+                        self.statsd_client.incr('provisioner.run_instances.count')
+                        self.statsd_client.timing(
+                            'provisioner.run_instances.%s.timing' % site_name, (after - before) * 1000)
+                        self.statsd_client.incr('provisioner.run_instances.%s.count' % site_name)
+                    except:
+                        log.exception("Failed to submit metrics")
             except timeout, t:
-                log.exception('Timeout when contacting IaaS to launch nodes: ' + str(t))
+                log.exception("Timeout when contacting IaaS to launch nodes: " + str(t))
 
                 one_node['state'] = states.FAILED
                 add_state_change(one_node, states.FAILED)
@@ -438,23 +484,30 @@ class ProvisionerCore(object):
                 launch = self.store.get_launch(one_node['launch_id'])
                 if launch:
                     self.maybe_update_launch_state(launch, states.FAILED)
-                    self.store_and_notify([one_node], launch['subscribers'])
+                self.store_and_notify([one_node])
 
                 raise timeout('IAAS_TIMEOUT')
         except Exception, e:
-            # XXX TODO introspect the exception to get more specific error information
-            log.exception('Error launching nodes: ' + str(e))
-            raise GeneralIaaSException(str(e))
+
+            # clean up contextualization if needed
+            self._node_ctx_cleanup(one_node)
+
+            exp_as_str = str(e)
+            if "InstanceLimitExceeded" in exp_as_str:
+                raise IaaSIsFullException(exp_as_str)
+            else:
+                log.exception("general IaaS Exception:")
+                raise GeneralIaaSException(exp_as_str)
 
         # underlying node driver may return a list or an object
         if not hasattr(iaas_nodes, '__iter__'):
             iaas_nodes = [iaas_nodes]
 
         if len(iaas_nodes) != len(nodes):
-            message = '%s nodes from IaaS launch but %s were expected' % (
-                    len(iaas_nodes), len(nodes))
-            log.error(message)
-            raise ProvisioningError('IAAS_PROBLEM '+ message)
+            message = "%s nodes from IaaS launch but %s were expected" % (
+                len(iaas_nodes), len(nodes))
+            log.warning(message)
+            raise ProvisioningError("IAAS_PROBLEM " + message)
 
         for node_rec, iaas_node in izip(nodes, iaas_nodes):
             node_rec['iaas_id'] = iaas_node.id
@@ -466,7 +519,8 @@ class ProvisionerCore(object):
             node_rec['pending_timestamp'] = time.time()
 
             extradict = {'public_ip': node_rec.get('public_ip'),
-                         'iaas_id': iaas_node.id, 'node_id': node_rec['node_id']}
+                         'iaas_id': iaas_node.id, 'node_id': node_rec['node_id'],
+                         }
             cei_events.event("provisioner", "new_node", extra=extradict)
 
     def _launch_node_spec(self, spec, driver, **kwargs):
@@ -474,14 +528,28 @@ class ProvisionerCore(object):
 
         Returns a single Node or a list of Nodes.
         """
+
         node_data = self._create_node_data(spec, driver, **kwargs)
         node = driver.create_node(**node_data)
+
+        if bool(kwargs.get('needs_elastic_ip', False)) is True:
+            elastic_ip = driver.ex_allocate_address()
+            log.debug("Allocated Elastic IP %s" % elastic_ip)
+        else:
+            elastic_ip = None
 
         if isinstance(node, (list, tuple)):
             for n in node:
                 n.ctx_name = spec.name
+                if elastic_ip is not None:
+                    n.elastic_ip = elastic_ip
+                    n.public_ip = elastic_ip
         else:
+
             node.ctx_name = spec.name
+            if elastic_ip is not None:
+                node.elastic_ip = elastic_ip
+                node.public_ip = elastic_ip
 
         return node
 
@@ -493,24 +561,23 @@ class ProvisionerCore(object):
         # libcloud would prefer we do driver.list_sizes() and list_images() but
         # those are ugly for lots of reasons.
         image = LibcloudNodeImage(spec.image, spec.name, driver)
-        size = LibcloudNodeSize(spec.size, spec.size, None, None, None, None,
-            driver)
+        size = LibcloudNodeSize(spec.size, spec.size, None, None, None, None, driver)
 
         node_data = {
-            'name':spec.name,
-            'size':size,
-            'image':image,
-            'ex_mincount':str(spec.count),
-            'ex_maxcount':str(spec.count),
-            'ex_userdata':spec.userdata,
-            'ex_keyname':spec.keyname,
-            }
+            'name': spec.name,
+            'size': size,
+            'image': image,
+            'ex_mincount': str(spec.count),
+            'ex_maxcount': str(spec.count),
+            'ex_userdata': spec.userdata,
+            'ex_keyname': spec.keyname,
+        }
 
         node_data.update(kwargs)
         # libcloud doesn't like args with None values
         return dict(pair for pair in node_data.iteritems() if pair[1] is not None)
 
-    def store_and_notify(self, records, subscribers):
+    def store_and_notify(self, records):
         """Convenience method to store records and notify subscribers.
         """
         for node in records:
@@ -518,13 +585,13 @@ class ProvisionerCore(object):
             node['update_counter'] = node_update_counter + 1
             self.maybe_update_node(node)
 
-        self.notifier.send_records(records, subscribers)
+        self.notifier.send_records(records)
 
     def maybe_update_node(self, node):
         updated = False
         current = node
         while not updated and current['state'] <= node['state']:
-            #HACK copying store metadata. really each operation should
+            # HACK copying store metadata. really each operation should
             # carefully decide whether to retry an update.
             node[VERSION_KEY] = current[VERSION_KEY]
             try:
@@ -548,26 +615,17 @@ class ProvisionerCore(object):
                 launch = self.store.get_launch(launch['launch_id'])
         return launch, updated
 
-    # XX log here
-    def dump_state(self, nodes, force_subscribe=None):
+    def dump_state(self, nodes):
         """Resends node state information to subscribers
 
         @param nodes list of node IDs
-        @param force_subscribe optional, an extra subscriber that may not be listed in local node records
         """
         for node_id in nodes:
             node = self.store.get_node(node_id)
             if node:
-                launch = self.store.get_launch(node['launch_id'])
-                subscribers = launch['subscribers']
-                if force_subscribe and not force_subscribe in subscribers:
-                    subscribers.append(force_subscribe)
-                self.notifier.send_record(node, subscribers)
+                self.notifier.send_record(node)
             else:
-                log.warn("Got dump_state request for unknown node '%s', notifying '%s' it is failed", node_id, force_subscribe)
-                record = {"node_id":node_id, "state":states.FAILED}
-                subscribers = [force_subscribe]
-                self.notifier.send_record(record, subscribers)
+                log.warn("Got dump_state request for unknown node '%s'", node_id)
 
     def query_nodes(self, concurrency=1):
         """Performs queries of IaaS sites and sends updates to subscribers.
@@ -594,6 +652,19 @@ class ProvisionerCore(object):
         if concurrency > 1:
             pool.join()
 
+        if self.statsd_client is not None:
+            try:
+                nodes = self.store.get_nodes(max_state=states.TERMINATING)
+                self.statsd_client.gauge("instances", len(nodes))
+                pending_nodes = self.store.get_nodes(state=states.PENDING)
+                self.statsd_client.gauge("pending_instances", len(pending_nodes))
+                running_nodes = self.store.get_nodes(min_state=states.STARTED, max_state=states.RUNNING)
+                self.statsd_client.gauge("running_instances", len(running_nodes))
+                terminating_nodes = self.store.get_nodes(state=states.TERMINATING)
+                self.statsd_client.gauge("terminating_instances", len(terminating_nodes))
+            except:
+                log.exception("Failed to submit metrics")
+
     def query_one_site(self, site, nodes, caller=None):
         with EpuLoggerThreadSpecific(user=caller):
             return self._query_one_site(site, nodes, caller=caller)
@@ -605,7 +676,7 @@ class ProvisionerCore(object):
             raise ProvisioningError("Called with bad caller %s" % caller)
 
         # Get the site description from DTRS
-        site_description = self.dtrs.describe_site(site)
+        site_description = self.dtrs.describe_site(site, caller=caller)
         if not site_description:
             raise ProvisioningError("Site description not found for %s" % site)
 
@@ -617,9 +688,22 @@ class ProvisionerCore(object):
         site_driver = SiteDriver(site_description, credentials_description, timeout=self.iaas_timeout)
 
         try:
+            before = time.time()
             libcloud_nodes = site_driver.driver.list_nodes()
-        except timeout, t:
-            log.exception('Timeout when querying site "%s"', site)
+            after = time.time()
+            if self.statsd_client is not None:
+                try:
+                    self.statsd_client.timing('provisioner.list_instances.timing', (after - before) * 1000)
+                    self.statsd_client.incr('provisioner.list_instances.count')
+                    self.statsd_client.timing('provisioner.list_instances.%s.timing' % site, (after - before) * 1000)
+                    self.statsd_client.incr('provisioner.list_instances.%s.count' % site)
+                except:
+                    log.exception("Failed to submit metrics")
+        except timeout:
+            log.exception("Timeout when querying site '%s'", site)
+            raise
+        except Exception:
+            log.exception("Failed to list nodes on site '%s'", site)
             raise
 
         libcloud_nodes = dict((node.id, node) for node in libcloud_nodes)
@@ -643,47 +727,42 @@ class ProvisionerCore(object):
                 start_time = node.get('pending_timestamp')
                 now = time.time()
                 if node['state'] == states.TERMINATING:
-                    log.debug('node %s: %s in datastore but unknown to IaaS.'+
-                              ' Termination must have already happened.',
-                        node['node_id'], states.TERMINATING)
+                    log.debug("node %s: %s in datastore but unknown to IaaS." +
+                              " Termination must have already happened.",
+                              node['node_id'], states.TERMINATING)
 
                     node['state'] = states.TERMINATED
                     add_state_change(node, states.TERMINATED)
-                    launch = self.store.get_launch(node['launch_id'])
-                    if launch:
-                        self.store_and_notify([node], launch['subscribers'])
+                    self.store_and_notify([node])
 
                 elif (node['state'] < states.STARTED and start_time and
-                    (now - start_time) <= _IAAS_NODE_QUERY_WINDOW_SECONDS):
-                    log.debug('node %s: not in query of IaaS, but within ' +
-                            'allowed startup window (%d seconds)',
-                            node['node_id'], _IAAS_NODE_QUERY_WINDOW_SECONDS)
+                      (now - start_time) <= _IAAS_NODE_QUERY_WINDOW_SECONDS):
+                    log.debug("node %s: not in query of IaaS, but within " +
+                              'allowed startup window (%d seconds)',
+                              node['node_id'], _IAAS_NODE_QUERY_WINDOW_SECONDS)
                 else:
-                    log.warn('node %s: in data store but unknown to IaaS. ' +
-                            'Marking as terminated.', node['node_id'])
+                    log.warn("node %s: in data store but unknown to IaaS. " +
+                             'Marking as terminated.', node['node_id'])
 
-                    node['state'] = states.FAILED
-                    add_state_change(node, states.FAILED)
+                    node['state'] = states.TERMINATED
+                    add_state_change(node, states.TERMINATED)
                     node['state_desc'] = 'NODE_DISAPPEARED'
-
-                    launch = self.store.get_launch(node['launch_id'])
-                    if launch:
-                        self.store_and_notify([node], launch['subscribers'])
+                    self.store_and_notify([node])
             else:
                 libcloud_state = _LIBCLOUD_STATE_MAP[libcloud_node.state]
 
                 # when contextualization is disabled or userdata is passed
                 # through directly, instances go straight to the RUNNING
                 # state
-                if libcloud_state == states.STARTED and (not self.context or node.get('iaas_userdata')):
+                if (libcloud_state == states.STARTED
+                        and not (self.context and node.get('needs_nimbus_ctx'))):
                     libcloud_state = states.RUNNING
 
                 if libcloud_state > node['state']:
-                    #TODO libcloud could go backwards in state.
+                    # TODO libcloud could go backwards in state.
 
                     node['state'] = libcloud_state
                     add_state_change(node, libcloud_state)
-
                     update_node_ip_info(node, libcloud_node)
 
                     if libcloud_state == states.STARTED:
@@ -691,23 +770,64 @@ class ProvisionerCore(object):
                         extradict = {'iaas_id': libcloud_id,
                                      'node_id': node.get('node_id'),
                                      'public_ip': node.get('public_ip'),
-                                     'private_ip': node.get('private_ip') }
-                        cei_events.event("provisioner", "node_started",
-                                     extra=extradict)
+                                     'private_ip': node.get('private_ip')}
+                        cei_events.event("provisioner", "node_started", extra=extradict)
 
-                    launch = self.store.get_launch(node['launch_id'])
-                    self.store_and_notify([node], launch['subscribers'])
+                    if libcloud_state in (states.STARTED, states.RUNNING):
+                        if node.get('elastic_ip'):
+                            try:
+                                site_driver.driver.ex_associate_addresses(libcloud_node, node.get('elastic_ip'))
+                                msg = "Associated elastic IP address %s with VM %s" % (
+                                    node.get('elastic_ip'), node.get('node_id'))
+                                log.debug(msg)
+                            except Exception:
+                                msg = "Couldn't associate elastic IP address %s with VM %s" % (
+                                    node.get('elastic_ip'), node.get('node_id'))
+                                log.exception(msg)
+
+                    self.store_and_notify([node])
+
                 elif libcloud_state == node['state']:
                     updated_ip = update_node_ip_info(node, libcloud_node)
                     if updated_ip:
-                        launch = self.store.get_launch(node['launch_id'])
-                        self.store_and_notify([node], launch['subscribers'])
-        #TODO libcloud_nodes now contains any other running instances that
-        # are unknown to the datastore (or were started after the query)
-        # Could do some analysis of these nodes
+                        self.store_and_notify([node])
+
+        # Check if we've lost track of any VMs that we've started. If so, destroy them
+        for libcloud_node_id, libcloud_node in libcloud_nodes.iteritems():
+
+            now = time.time()
+            libcloud_node_token = libcloud_node.extra.get('clienttoken', "")
+            libcloud_node_state = libcloud_node.state
+
+            if (libcloud_node_token and libcloud_node_token.startswith(EPU_CLIENT_TOKEN_PREFIX) and
+                    libcloud_node_state == LibcloudNodeState.RUNNING):
+
+                if libcloud_node_id in self._potential_zombie_nodes:
+                    if now - self._potential_zombie_nodes[libcloud_node_id] > _POTENTIAL_ZOMBIE_QUERY_WINDOW_SECONDS:
+
+                        try:
+                            log.warning("Found zombie VM (%s). Destroying it" % libcloud_node_id)
+                            site_driver.driver.destroy_node(libcloud_node)
+                            del self._potential_zombie_nodes[libcloud_node_id]
+                            log.warning("Destroyed zombie VM (%s)." % libcloud_node_id)
+                        except timeout:
+                            log.exception("Timeout when terminating zombie VM %s with iaas_id %s",
+                                          libcloud_node_id, libcloud_node.id)
+                        except Exception:
+                            log.exception("Problem when terminating zombie VM %s with iaas_id %s",
+                                          libcloud_node_id, libcloud_node.id)
+                    else:
+                        log.debug("%s looks like a zombie VM, but we haven't seen it for %ss yet" %
+                                (libcloud_node_id, _POTENTIAL_ZOMBIE_QUERY_WINDOW_SECONDS))
+                else:
+                    log.debug("Marking %s as a potential zombie VM" % libcloud_node_id)
+                    self._potential_zombie_nodes[libcloud_node_id] = now
+            else:
+                # This node wasn't started by the provisioner or is terminated
+                pass
 
     def _get_nodes_by_id(self, node_ids, skip_missing=True):
-        """Helper method tp retrieve node records from a list of IDs
+        """Helper method to retrieve node records from a list of IDs
         """
         nodes = []
         for node_id in node_ids:
@@ -724,7 +844,7 @@ class ProvisionerCore(object):
         if not self.context:
             return
 
-        #grab all the launches in the pending state
+        # grab all the launches in the pending state
         launches = self.store.get_launches(state=states.PENDING)
         if launches:
             log.debug("Querying state of %d contexts", len(launches))
@@ -749,16 +869,15 @@ class ProvisionerCore(object):
 
         context = launch.get('context')
         if not context:
-            log.warn('Launch %s is in %s state but it has no context!',
-                    launch['launch_id'], launch['state'])
+            log.warn("Launch %s is in %s state but it has no context!",
+                     launch['launch_id'], launch['state'])
             return
-
 
         all_pending = all(node['state'] >= states.PENDING for node in nodes)
         if not all_pending:
             log.debug("Not all nodes for launch %s are pending or running" +
-                    " in IaaS yet. Skipping this context query for now.",
-                    launch_id)
+                      " in IaaS yet. Skipping this context query for now.",
+                      launch_id)
 
             # note that this check is important for preventing races (I think).
             # if we start querying before all nodes are running in IaaS the
@@ -775,25 +894,25 @@ class ProvisionerCore(object):
             #   mark the node as FAILED, it is possible the other worker will
             #   simultaneously be starting it and the node will be "leaked".
 
-            return # *** EARLY RETURN ***
+            return  # *** EARLY RETURN ***
 
         valid = any(node['state'] < states.TERMINATING for node in nodes)
         if not valid:
-            log.info("The context for launch %s has no valid nodes. They "+
-                     "have likely been terminated. Marking launch as FAILED. "+
+            log.info("The context for launch %s has no valid nodes. They " +
+                     "have likely been terminated. Marking launch as FAILED. " +
                      "nodes: %s", launch_id, node_ids)
             self.maybe_update_launch_state(launch, states.FAILED)
-            return # *** EARLY RETURN ***
+            return  # *** EARLY RETURN ***
 
         ctx_uri = context['uri']
-        log.debug('Querying context %s for launch %s ', ctx_uri, launch_id)
+        log.debug("Querying context %s for launch %s " % (ctx_uri, launch_id))
 
         try:
             context_status = self.context.query(ctx_uri)
 
         except (BrokerAuthError, ContextNotFoundError), e:
-            log.error("permanent error from context broker for launch %s. "+
-                      "Marking launch as FAILED. Error: %s", launch_id, e)
+            log.error("Permanent error from context broker for launch %s. " +
+                      "Marking launch as FAILED, error: %s", launch_id, e)
 
             # first mark instances as failed, then the launch. Otherwise a
             # crash at this moment could leave some nodes stranded at
@@ -809,16 +928,16 @@ class ProvisionerCore(object):
                     updated_nodes.append(node)
             if updated_nodes:
                 log.debug("Marking %d nodes as %s", len(updated_nodes), states.RUNNING_FAILED)
-                self.store_and_notify(updated_nodes, launch['subscribers'])
+                self.store_and_notify(updated_nodes)
 
             self.maybe_update_launch_state(launch, states.FAILED)
 
-            return # *** EARLY RETURN ***
+            return  # *** EARLY RETURN ***
 
-        except BrokerError,e:
+        except BrokerError, e:
             log.error("Error querying context broker: %s", e, exc_info=True)
             # hopefully this is some temporal failure, query will be retried
-            return # *** EARLY RETURN ***
+            return  # *** EARLY RETURN ***
 
         ctx_nodes = context_status.nodes
 
@@ -829,11 +948,11 @@ class ProvisionerCore(object):
         now = time.time()
         for node in nodes:
             if node not in map(lambda mn: mn['node'], matched_nodes):
-                if node['state'] == states.STARTED and node['running_timestamp'] + INSTANCE_READY_TIMEOUT < now:
+                if node['state'] == states.STARTED and node['running_timestamp'] + self.instance_ready_timeout < now:
                     log.info(("Node %s failed to check in with the context " +
-                              "broker within the %d seconds timeout, marking " +
-                              "it as RUNNING_FAILED") %
-                              (node['node_id'], INSTANCE_READY_TIMEOUT))
+                             "broker within the %d seconds timeout, marking " +
+                             "it as RUNNING_FAILED") %
+                             (node['node_id'], self.instance_ready_timeout))
 
                     node['state'] = states.RUNNING_FAILED
                     add_state_change(node, states.RUNNING_FAILED)
@@ -842,20 +961,20 @@ class ProvisionerCore(object):
                     extradict = {'iaas_id': node.get('iaas_id'),
                                  'node_id': node.get('node_id'),
                                  'public_ip': node.get('public_ip'),
-                                 'private_ip': node.get('private_ip') }
+                                 'private_ip': node.get('private_ip')}
                     cei_events.event("provisioner", "node_ctx_timeout",
                                      extra=extradict)
 
         if updated_nodes:
             log.debug("%d nodes need to be updated as a result of the context query" %
-                    len(updated_nodes))
-            self.store_and_notify(updated_nodes, launch['subscribers'])
+                      len(updated_nodes))
+            self.store_and_notify(updated_nodes)
 
         all_done = all(ctx_node.ok_occurred or
                        ctx_node.error_occurred for ctx_node in ctx_nodes)
 
         if context_status.complete and all_done:
-            log.info('Launch %s context is "all-ok": done!', launch_id)
+            log.info("Launch %s context is 'all-ok': done!", launch_id)
             # update the launch record so this context won't be re-queried
             extradict = {'launch_id': launch_id, 'node_ids': launch['node_ids']}
             if all(ctx_node.ok_occurred for ctx_node in ctx_nodes):
@@ -865,14 +984,14 @@ class ProvisionerCore(object):
             self.maybe_update_launch_state(launch, states.RUNNING)
 
         elif context_status.complete:
-            log.info('Launch %s context is "complete" (all checked in, but not all-ok)', launch_id)
+            log.info("Launch %s context is 'complete' (all checked in, but not all-ok)", launch_id)
         else:
             if not ctx_nodes:
-                log.debug('Launch %s context has no nodes (yet)', launch_id)
+                log.debug("Launch %s context has no nodes (yet)", launch_id)
             else:
-                log.debug('Launch %s context is incomplete: %s of %s nodes',
-                        launch_id, len(context_status.nodes),
-                        context_status.expected_count)
+                log.debug("Launch %s context is incomplete: %s of %s nodes",
+                          launch_id, len(context_status.nodes),
+                          context_status.expected_count)
 
     # Record reaper main method
     def reap_records(self, record_reaping_max_age):
@@ -904,7 +1023,7 @@ class ProvisionerCore(object):
                                     self.store.update_launch(launch)
                                     updated = True
                                 except WriteConflictError:
-                                    launch = self.store.get_launch(launch_id)
+                                    launch = self.store.get_launch(launch['launch_id'])
 
                             if not launch['node_ids']:
                                 launch_id = launch['launch_id']
@@ -912,27 +1031,17 @@ class ProvisionerCore(object):
                                 self.store.remove_launch(launch_id)
                         else:
                             log.warn("Node %s was part of missing launch %s" % (node['node_id'], node['launch_id']))
-                except Exception as e:
-                    log.exception('Error when deleting old node record %s' % node['node_id'])
+                except Exception:
+                    log.exception("Error when deleting old node record %s" % node['node_id'])
                     continue
 
     def terminate_all(self):
         """Mark all nodes as terminating
         """
         nodes = self.store.get_nodes(max_state=states.TERMINATING)
-        launch_groups = group_records(nodes, 'launch_id')
-        launch_nodes_pairs = []
-        for launch_id, launch_nodes in launch_groups.iteritems():
-            launch = self.store.get_launch(launch_id)
-            if not launch:
-                log.warn('Failed to find launch record %s', launch_id)
-                continue
-
-            launch_nodes_pairs.append((launch, launch_nodes))
-
-            for node in launch_nodes:
-                if node['state'] < states.TERMINATING:
-                    self._mark_one_node_terminating(node, launch)
+        for node in nodes:
+            if node['state'] < states.TERMINATING:
+                self._mark_one_node_terminating(node)
 
     def check_terminate_all(self):
         """Check if there are no launches left to terminate
@@ -944,28 +1053,38 @@ class ProvisionerCore(object):
         with EpuLoggerThreadSpecific(user=caller):
             return self._mark_nodes_terminating(node_ids, caller=caller)
 
+    def _create_unknown_node_terminated_record(self, node_id, caller=None):
+        node = dict(launch_id=self.UNKNOWN_LAUNCH_ID, node_id=node_id,
+            state_desc=None, creator=caller, state=states.TERMINATED)
+        add_state_change(node, states.TERMINATED)
+        return node
+
     def _mark_nodes_terminating(self, node_ids, caller=None):
         """Mark a set of nodes as terminating in the data store
         """
-        nodes = self._get_nodes_by_id(node_ids)
         log.debug("Marking nodes for termination: %s", node_ids)
+        nodes = []
+        for node_id in node_ids:
+            node = self.store.get_node(node_id)
+            if node is None:
+                # construct a fake TERMINATED node record
+                node = self._create_unknown_node_terminated_record(node_id)
+                try:
+                    self.store.add_node(node)
+                    self.notifier.send_record(node)
+                    log.warn("Created stub TERMINATED record for unknown node %s", node_id)
+                except WriteConflictError:
+                    # record must have been just added
+                    node = self.store.get_node(node_id)
+            if node:
+                check_user(caller=caller, creator=node.get('creator'))
+                nodes.append(node)
 
-        launches = group_records(nodes, 'launch_id')
-        for launch_id, launch_nodes in launches.iteritems():
-            launch = self.store.get_launch(launch_id)
-
-
-            if not launch:
-                log.warn('Failed to find launch record %s', launch_id)
-                continue
-
-            check_user(caller=caller, creator=launch.get('creator'))
-
-            for node in launch_nodes:
-                self._mark_one_node_terminating(node, launch)
+            for node in nodes:
+                self._mark_one_node_terminating(node)
         return nodes
 
-    def _mark_one_node_terminating(self, node, launch):
+    def _mark_one_node_terminating(self, node):
         if node['state'] < states.TERMINATING:
             self.store.add_terminating(node['node_id'])
             node['state'] = states.TERMINATING
@@ -973,46 +1092,55 @@ class ProvisionerCore(object):
             extradict = {'iaas_id': node.get('iaas_id'),
                          'node_id': node.get('node_id'),
                          'public_ip': node.get('public_ip'),
-                         'private_ip': node.get('private_ip') }
+                         'private_ip': node.get('private_ip')}
             cei_events.event("provisioner", "node_terminating",
                              extra=extradict)
-            self.store_and_notify([node], launch['subscribers'])
+        self.store_and_notify([node])
 
-    def terminate_nodes(self, node_ids, caller=None, remove_terminating=True,
-            exception_queue=None):
+    def terminate_nodes(self, node_ids, caller=None, remove_terminating=True):
         """Destroy all specified nodes.
+
+        This is currently only used from tests
         """
         with EpuLoggerThreadSpecific(user=caller):
             nodes = self._get_nodes_by_id(node_ids, skip_missing=False)
             for node_id, node in izip(node_ids, nodes):
                 if not node:
-                    #maybe an error should make it's way to controller from here?
-                    log.warn('Node %s unknown but requested for termination',
-                            node_id)
+                    # maybe an error should make it's way to controller from here?
+                    log.warn("Node %s unknown but requested for termination",
+                             node_id)
                     continue
 
-                launch = self.store.get_launch(node['launch_id'])
-                self._terminate_node(node, launch,
-                        remove_terminating=remove_terminating, exception_queue=exception_queue)
+                self._terminate_node(node, remove_terminating=remove_terminating)
 
-    def _terminate_node(self, node, launch, remove_terminating=True, exception_queue=None):
-        terminate = True
-        log.info("Terminating node %s", node['node_id'])
+    def terminate_node(self, node, remove_terminating=True):
+        try:
+            self._terminate_node(node, remove_terminating)
+        except Exception:
+            log.exception("Error terminating node %s", node)
+            raise
+
+    def _terminate_node(self, node, remove_terminating):
 
         if node['state'] < states.PENDING:
-            log.info("Node %s requested for termination before it reached PENDING, no need to terminate in IaaS", node['node_id'])
-            terminate = False
+            log.info("Node %s requested for termination before it reached PENDING, "
+                     "no need to terminate in IaaS", node['node_id'])
+        elif node['state'] >= states.TERMINATED:
+            log.info("Node %s requested for termination but it is already %s",
+                node['node_id'], node['state'])
 
-        if terminate:
+        else:
+            log.info("Terminating node %s", node['node_id'])
+
             site_name = node['site']
-            caller = launch['creator']
+            caller = node['creator']
             if not caller:
-                msg = "Launch %s has bad creator %s" % (launch['launch_id'], caller)
+                msg = "Node %s has bad creator %s" % (node['node_id'], caller)
                 log.error(msg)
                 raise ProvisioningError(msg)
 
             # Get the site description from DTRS
-            site_description = self.dtrs.describe_site(site_name)
+            site_description = self.dtrs.describe_site(site_name, caller=caller)
             if not site_description:
                 msg = "Site description not found for %s" % site_name
                 log.error(msg)
@@ -1025,45 +1153,96 @@ class ProvisionerCore(object):
                 log.error(msg)
                 raise ProvisioningError(msg)
 
+            self._node_ctx_cleanup(node)
+
             site_driver = SiteDriver(site_description, credentials_description, timeout=self.iaas_timeout)
             libcloud_node = self._to_libcloud_node(node, site_driver.driver)
+            if node.get('elastic_ip'):
+                elastic_ip = node['elastic_ip']
+                try:
+                    log.info("Cleaning up Elastic IP for node %s on IaaS", node.get('node_id'))
+                    site_driver.driver.ex_disassociate_address(elastic_ip)
+                    site_driver.driver.ex_release_address(elastic_ip)
+                except timeout:
+                    log.exception("Timeout when releasing Elastic IP %s for node %s with iaas_id %s",
+                                elastic_ip, node.get('node_id'), node.get('iaas_id'))
+                except Exception:
+                    log.exception("Problem when releasing Elastic IP %s for node %s with iaas_id %s",
+                                elastic_ip, node.get('node_id'), node.get('iaas_id'))
+
             try:
                 log.info("Destroying node %s on IaaS", node.get('node_id'))
                 site_driver.driver.destroy_node(libcloud_node)
-            except timeout, t:
-                log.exception('Timeout when terminating node %s with iaas_id %s',
-                        node.get('node_id'), node.get('iaas_id'))
-                raise t
-            except Exception, e:
-                log.exception('Problem when terminating %s with iaas_id %s',
-                        node.get('node_id'), node.get('iaas_id'))
-                raise e
+            except timeout:
+                log.exception("Timeout when terminating node %s with iaas_id %s",
+                              node.get('node_id'), node.get('iaas_id'))
+                raise
+            except Exception:
+                log.exception("Problem when terminating %s with iaas_id %s",
+                              node.get('node_id'), node.get('iaas_id'))
+                raise
 
         node['state'] = states.TERMINATED
         add_state_change(node, states.TERMINATED)
         extradict = {'iaas_id': node.get('iaas_id'),
                      'node_id': node.get('node_id'),
                      'public_ip': node.get('public_ip'),
-                     'private_ip': node.get('private_ip') }
+                     'private_ip': node.get('private_ip')}
         cei_events.event("provisioner", "node_terminated",
                          extra=extradict)
 
-        self.store_and_notify([node], launch['subscribers'])
+        self.store_and_notify([node])
         if remove_terminating:
             self.store.remove_terminating(node.get('node_id'))
             log.info("Removed terminating entry for node %s from store",
-                    node.get('node_id'))
+                     node.get('node_id'))
+
+    def _node_ctx_cleanup(self, node):
+        """Called before a node is terminated or failed
+        to perform any necessary ctx cleanup steps
+        """
+        ctx_method = node.get('ctx_method')
+        caller = node['creator']
+        node_id = node['node_id']
+        if ctx_method == 'chef':
+            try:
+                credential_name = node.get('chef_credential')
+                chef_credentials = self.dtrs.describe_credentials(caller, credential_name,
+                    credential_type="chef")
+                if not chef_credentials:
+                    log.warn("Couldn't find Chef credentials '%s' for caller '%s':"
+                             "cannot cleanup context for terminating node %s",
+                             credential_name, caller, node_id)
+                    return
+
+                server_url = chef_credentials['url']
+                client_key = chef_credentials['client_key']
+            except Exception:
+                log.exception("Error retrieving Chef credentials for node '%s'. "
+                              "Cannot clean up in Chef server.", node_id)
+                return
+
+            try:
+                chefutil.delete_chef_node(node_id, server_url, client_key,
+                    chef_credentials.get('client_name'))
+            except NotFoundError:
+                log.warn("Chef node '%s' not found in server %s while attempting to delete",
+                         node_id, server_url)
+
+            except Exception:
+                log.exception("Error attempting to delete Chef node '%s' from server %s",
+                              node_id, server_url)
 
     def _to_libcloud_node(self, node, driver):
         """libcloud drivers need a Node object for termination.
         """
-        #this is unfortunately tightly coupled with EC2 libcloud driver
+        # this is unfortunately tightly coupled with EC2 libcloud driver
         # right now. We are building a fake Node object that only has the
         # attribute needed for termination (id). Would need to be fleshed out
         # to work with other drivers.
         return LibcloudNode(id=node['iaas_id'], name=None, state=None,
-                public_ips=None, private_ips=None,
-                driver=driver)
+                            public_ips=None, private_ips=None,
+                            driver=driver)
 
     def describe_nodes(self, nodes=None, caller=None):
         """Produce a list of node records
@@ -1114,10 +1293,11 @@ def update_node_ip_info(node_rec, iaas_node):
     updated = False
 
     public_ip = node_rec.get('public_ip')
+    elastic_ip = node_rec.get('elastic_ip')
     iaas_public_ip = iaas_node.public_ip
     if isinstance(iaas_public_ip, (list, tuple)):
         iaas_public_ip = iaas_public_ip[0] if iaas_public_ip else None
-    if not public_ip or (iaas_public_ip and public_ip != iaas_public_ip):
+    if not elastic_ip and (not public_ip or (iaas_public_ip and public_ip != iaas_public_ip)):
         node_rec['public_ip'] = iaas_public_ip
         updated = True
 
@@ -1133,11 +1313,20 @@ def update_node_ip_info(node_rec, iaas_node):
     iaas_hostname = iaas_node.extra.get('dns_name')
     if isinstance(iaas_hostname, (list, tuple)):
         iaas_hostname = iaas_hostname[0] if iaas_hostname else None
-    if not hostname or (iaas_hostname and hostname != iaas_hostname):
+    if iaas_hostname and (not hostname or (iaas_hostname and hostname != iaas_hostname)):
         node_rec['hostname'] = iaas_hostname
         updated = True
 
+    try:
+        if iaas_node.elastic_ip is not None:
+            node_rec['elastic_ip'] = iaas_node.elastic_ip
+            node_rec['public_ip'] = iaas_node.elastic_ip
+            updated = True
+    except AttributeError:
+        pass
+
     return updated
+
 
 def match_nodes_from_context(nodes, ctx_nodes):
     matched_nodes = []
@@ -1157,16 +1346,17 @@ def match_nodes_from_context(nodes, ctx_nodes):
                 # can add more matches if needed
 
             if match_node:
-                log.debug('Matched ctx identity to node by: ' + match_reason)
-                matched_nodes.append(dict(node=match_node,ctx_node=ctx_node,ident=ident))
+                log.debug("Matched ctx identity to node by: " + match_reason)
+                matched_nodes.append(dict(node=match_node, ctx_node=ctx_node, ident=ident))
                 break
 
             else:
                 # this isn't necessarily an exceptional condition. could be a private
                 # IP for example. Right now we are only matching against public
-                log.debug('Context identity has unknown IP (%s) and hostname (%s)',
-                        ident.ip, ident.hostname)
+                log.debug("Context identity has unknown IP (%s) and hostname (%s)",
+                          ident.ip, ident.hostname)
     return matched_nodes
+
 
 def update_nodes_from_context(matched_nodes):
     updated_nodes = []
@@ -1175,6 +1365,7 @@ def update_nodes_from_context(matched_nodes):
             updated_nodes.append(match_node['node'])
 
     return updated_nodes
+
 
 def _update_one_node_from_ctx(node, ctx_node, identity):
     node_done = ctx_node.ok_occurred or ctx_node.error_occurred
@@ -1191,6 +1382,7 @@ def _update_one_node_from_ctx(node, ctx_node, identity):
         node['ctx_error_code'] = ctx_node.error_code
         node['ctx_error_message'] = ctx_node.error_message
     return True
+
 
 def add_state_change(node, state):
     now = time.time()
@@ -1220,8 +1412,6 @@ class ProvisionerContextClient(object):
         """Creates a new context with the broker
         """
         client = self._get_client()
-        #TODO: was:
-        #return threads.deferToThread(client.create_context)
         context = client.create_context()
         return context
 
@@ -1231,13 +1421,12 @@ class ProvisionerContextClient(object):
         resource is the uri returned by create operation
         """
         client = self._get_client()
-        #TODO: was:
-        #return threads.deferToThread(client.get_status, resource)
         return client.get_status(resource)
 
 
 class ProvisioningError(Exception):
     pass
+
 
 class ProvisionerDisabledError(Exception):
     pass

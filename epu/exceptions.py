@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 
 
 class BadRequestError(Exception):
@@ -27,9 +29,25 @@ class ProgrammingError(Exception):
     """
 
 
+class PolicyError(Exception):
+    """Something went wrong with a policy somewhere
+    """
+
+
 class GeneralIaaSException(Exception):
     """
     Unknown Exceptions that have come from the provisioner when communicating with IaaS
+    """
+
+
+class IaaSIsFullException(GeneralIaaSException):
+    """
+    IaaS site can not start any more VMs with the parameters specified
+    """
+
+
+class SiteDefinitionValidationError(Exception):
+    """An exception for when a site definition is incorrect
     """
 
 

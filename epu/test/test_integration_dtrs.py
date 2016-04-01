@@ -1,9 +1,11 @@
+# Copyright 2013 University of Chicago
+
 import os
 import uuid
 import unittest
 import logging
-from dashi import DashiError
 
+from dashi import DashiError
 from nose.plugins.skip import SkipTest
 
 try:
@@ -12,42 +14,41 @@ try:
 except ImportError:
     raise SkipTest("epuharness not available.")
 try:
-    from epu.mocklibcloud import MockEC2NodeDriver
+    from epu.mocklibcloud import MockEC2NodeDriver  # noqa
 except ImportError:
     raise SkipTest("sqlalchemy not available.")
 
-from epu.test import ZooKeeperTestMixin
-from epu.states import InstanceState
 
 log = logging.getLogger(__name__)
 
 default_user = 'default'
 
 basic_deployment = """
-process-dispatchers:                                                             
-  pd_0:                                                                          
-    config:                                                                      
-      processdispatcher:                                                         
-        engines:                                                                 
-          default:                                                               
-            deployable_type: eeagent                                             
-            slots: 4                                                             
-            base_need: 1                                                         
-epums:                                                                           
-  epum_0:                                                                        
-    config:                                                                      
-      epumanagement:                                                             
+process-dispatchers:
+  pd_0:
+    config:
+      processdispatcher:
+        engines:
+          default:
+            deployable_type: eeagent
+            slots: 4
+            base_need: 1
+epums:
+  epum_0:
+    config:
+      epumanagement:
         default_user: %(default_user)s
         provisioner_service_name: prov_0
-      logging:                                                                   
-        handlers:                                                                
-          file:                                                                  
-            filename: /tmp/epum_0.log   
+      logging:
+        handlers:
+          file:
+            filename: /tmp/epum_0.log
 provisioners:
   prov_0:
     config:
       provisioner:
         default_user: %(default_user)s
+        epu_management_service_name: epum_0
 dt_registries:
   dtrs:
     config: {}
@@ -55,41 +56,45 @@ dt_registries:
 
 
 fake_credentials = {
-  'access_key': 'xxx',
-  'secret_key': 'xxx',
-  'key_name': 'ooi'
+    'access_key': 'xxx',
+    'secret_key': 'xxx',
+    'key_name': 'ooi'
 }
 
 dt_name = "example"
 example_dt = {
-  'mappings': {
-    'ec2-fake':{
-      'iaas_image': 'ami-fake',
-      'iaas_allocation': 't1.micro',
+    'mappings': {
+        'ec2-fake': {
+            'iaas_image': 'ami-fake',
+            'iaas_allocation': 't1.micro',
+        }
+    },
+    'contextualization': {
+        'method': 'chef-solo',
+        'chef_config': {}
     }
-  },
-  'contextualization':{
-    'method': 'chef-solo',
-    'chef_config': {}
-  }
 }
 
 g_epuharness = None
-g_deployment = basic_deployment % {"default_user" : default_user}
+g_deployment = basic_deployment % {"default_user": default_user}
+
 
 def setUpModule():
-    epuh_persistence = "/tmp/SupD/epuharness"
+    epuh_persistence = os.environ.get('EPUHARNESS_PERSISTENCE_DIR', '/tmp/SupD/epuharness')
     if os.path.exists(epuh_persistence):
         raise SkipTest("EPUHarness running. Can't run this test")
 
     global g_epuharness
     exchange = "testexchange-%s" % str(uuid.uuid4())
-    g_epuharness = EPUHarness(exchange=exchange)
+    sysname = "testsysname-%s" % str(uuid.uuid4())
+    g_epuharness = EPUHarness(exchange=exchange, sysname=sysname)
     g_epuharness.start(deployment_str=g_deployment)
+
 
 def tearDownModule():
     global g_epuharness
     g_epuharness.stop()
+
 
 class TestIntegrationDTRS(unittest.TestCase, TestFixture):
 
@@ -105,7 +110,6 @@ class TestIntegrationDTRS(unittest.TestCase, TestFixture):
 
         self.block_until_ready(g_deployment, g_epuharness.dashi)
 
-
     def dtrs_simple_add_remove_test(self):
         new_dt_name = str(uuid.uuid4())
         self.dtrs_client.add_dt(self.user, new_dt_name, example_dt)
@@ -115,13 +119,12 @@ class TestIntegrationDTRS(unittest.TestCase, TestFixture):
         dts = self.dtrs_client.list_dts(self.user)
         self.assertFalse(new_dt_name in dts, "The name %s should not have been found" % (new_dt_name))
 
-
     def dtrs_simple_add_describe_remove_test(self):
         new_dt_name = str(uuid.uuid4())
         self.dtrs_client.add_dt(self.user, new_dt_name, example_dt)
         desc = self.dtrs_client.describe_dt(self.user, new_dt_name)
 
-        self.assertEquals(example_dt, desc, "The 2 dts did not match ||| %s ||| %s" % (str(desc), str(example_dt)))        
+        self.assertEquals(example_dt, desc, "The 2 dts did not match ||| %s ||| %s" % (str(desc), str(example_dt)))
 
         self.dtrs_client.remove_dt(self.user, new_dt_name)
 
@@ -137,8 +140,7 @@ class TestIntegrationDTRS(unittest.TestCase, TestFixture):
         new_desc = self.dtrs_client.describe_dt(self.user, new_dt_name)
 
         self.assertEqual(new_desc[key], val)
-        self.assertEqual(desc, new_desc, "The 2 dts did not match ||| %s ||| %s" % (str(desc), str(new_desc)))    
-
+        self.assertEqual(desc, new_desc, "The 2 dts did not match ||| %s ||| %s" % (str(desc), str(new_desc)))
 
         self.dtrs_client.remove_dt(self.user, new_dt_name)
 
@@ -149,7 +151,7 @@ class TestIntegrationDTRS(unittest.TestCase, TestFixture):
         passed = False
         try:
             self.dtrs_client.add_dt(self.user, new_dt_name, example_dt)
-        except DashiError, de:
+        except DashiError:
             passed = True
         self.assertTrue(passed, "an exception should have been raised")
         self.dtrs_client.remove_dt(self.user, new_dt_name)
@@ -159,7 +161,7 @@ class TestIntegrationDTRS(unittest.TestCase, TestFixture):
         passed = False
         try:
             self.dtrs_client.remove_dt(self.user, new_dt_name)
-        except DashiError, de:
+        except DashiError:
             passed = True
         self.assertTrue(passed, "an exception should have been raised")
 
@@ -170,7 +172,7 @@ class TestIntegrationDTRS(unittest.TestCase, TestFixture):
         passed = False
         try:
             self.dtrs_client.remove_dt(self.user, new_dt_name)
-        except DashiError, de:
+        except DashiError:
             passed = True
         self.assertTrue(passed, "an exception should have been raised")
 
@@ -179,18 +181,11 @@ class TestIntegrationDTRS(unittest.TestCase, TestFixture):
         passed = False
         try:
             self.dtrs_client.update_dt(self.user, new_dt_name, example_dt)
-        except DashiError, de:
+        except DashiError:
             passed = True
         self.assertTrue(passed, "an exception should have been raised")
 
     def dtrs_describe_dt_that_doesnt_exist_test(self):
         new_dt_name = str(uuid.uuid4())
-        passed = False
-        try:
-            self.dtrs_client.describe_dt(self.user, new_dt_name)
-        except DashiError, de:
-            passed = True
-        self.assertTrue(passed, "an exception should have been raised")
-
-
-
+        dt = self.dtrs_client.describe_dt(self.user, new_dt_name)
+        self.assertEqual(dt, None)

@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Copyright 2013 University of Chicago
 
 
 class InstanceState(object):
@@ -6,7 +7,7 @@ class InstanceState(object):
     """
 
     REQUESTING = '100-REQUESTING'
-    """Request has been made but not acknowledged through SA"""
+    """Request has been made but not acknowledged by Provisioner"""
 
     REQUESTED = '200-REQUESTED'
     """Request has been acknowledged by provisioner"""
@@ -166,13 +167,19 @@ class ProcessState(object):
     REJECTED.
     """
 
-    PENDING = "400-PENDING"
+    ASSIGNED = "350-ASSIGNED"
     """Process is deploying to a slot
 
-    A slot has been assigned to the process and deployment is underway. It
-    is quite possible for the resource or process to die before deployment
-    succeeds however. Once a process reaches this state, moving back to
-    an earlier state requires an increment of the process' round.
+    Process is assigned to a slot and deployment is underway. Once a
+    process reaches this state, moving back to an earlier state requires an
+    increment of the process' round.
+
+    """
+
+    PENDING = "400-PENDING"
+    """Process is starting on a resource
+
+    A process has been deployed to a slot and is starting.
     """
 
     RUNNING = "500-RUNNING"
@@ -251,3 +258,33 @@ class ProcessDispatcherState(object):
     """
 
     VALID_STATES = (UNINITIALIZED, SYSTEM_BOOTING, OK)
+
+
+class ExecutionResourceState(object):
+
+    OK = "OK"
+    """Resource is active and healthy
+    """
+
+    WARNING = "WARNING"
+    """The resource is under suspicion due to missing or late heartbeats
+
+    Running processes are not rescheduled yet, but the resource is not
+    assigned any new processes while in this state. Note: This could later
+    be refined to allow processes, but only if there are no compatible slots
+    available on healthy resources.
+    """
+
+    MISSING = "MISSING"
+    """The resource has been declared dead by the PD Doctor due to a prolonged
+    lack of heartbeats.
+
+    Running processes on the resource have been rescheduled (if applicable)
+    and the resource is ineligible for running new processes. If the resource
+    resumes sending heartbeats, it will be returned to the OK state and made
+    available for processes.
+    """
+
+    DISABLED = "DISABLED"
+    """The resource has been disabled, likely in advance of being terminated
+    """

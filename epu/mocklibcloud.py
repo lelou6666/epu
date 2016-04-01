@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import time
 
 from uuid import uuid4
@@ -36,7 +38,7 @@ class MockEC2NodeDriver(NodeDriver):
     _fail_to_start = False
     connection = MockConnection()
 
-    def __init__(self, sqlite_db=None, **kwargs):
+    def __init__(self, sqlite_db=None, operation_time=0.3, **kwargs):
 
         self.sqlite_db = sqlite_db
 
@@ -48,7 +50,7 @@ class MockEC2NodeDriver(NodeDriver):
         SQLBackedObject.metadata.create_all(self.engine)
         Session = sessionmaker(bind=self.engine)
         self.session = Session()
-        self._operation_time = 0.5  # How long each operation should take
+        self._operation_time = operation_time  # How long each operation should take
 
         self._add_size("t1.micro", "t1.micro", 512, 512, 512, 100)
 
@@ -88,10 +90,25 @@ class MockEC2NodeDriver(NodeDriver):
         state = self._get_state()
         return state.create_error_count
 
-    def list_nodes(self):
+    def ex_release_address(self, elastic_ip):
+        self.wait()
+
+    def ex_allocate_address(self):
+        return "0.0.0.0"
+
+    def ex_associate_addresses(self, node, elastic_ip):
+        self.wait()
+
+    def ex_disassociate_address(self, elastic_ip):
+        pass
+
+    def list_nodes(self, immediate=False):
+        """use immediate=True to return without waiting. for use from tests
+        """
         mock_nodes = self.session.query(MockNode)
         nodes = [mock_node.to_node() for mock_node in mock_nodes]
-        self.wait()
+        if not immediate:
+            self.wait()
         return nodes
 
     def create_node(self, **kwargs):
@@ -149,6 +166,10 @@ class MockEC2NodeDriver(NodeDriver):
         self.wait()
         return
 
+    def get_mock_ip(self, elastic_ip):
+        mock_ip = try_n_times(self.session.query, MockElasticIP).filter_by(public_ip=elastic_ip).one()
+        return mock_ip
+
     def get_mock_node(self, node):
         mock_node = try_n_times(self.session.query, MockNode).filter_by(node_id=node.id).one()
         return mock_node
@@ -189,12 +210,23 @@ class MockNode(SQLBackedObject):
             extra['ex_userdata'] = self.userdata
         if self.client_token:
             extra['ex_clienttoken'] = self.client_token
+            extra['clienttoken'] = self.client_token
 
         if not extra:
             extra = None
 
-        n = Node(id=self.node_id, name=self.name, state=int(self.state), public_ips=self.public_ips, private_ips=self.private_ips, extra=extra, driver=MockEC2NodeDriver)
+        n = Node(id=self.node_id, name=self.name, state=int(self.state),
+            public_ips=self.public_ips, private_ips=self.private_ips,
+            extra=extra, driver=MockEC2NodeDriver)
         return n
+
+
+class MockElasticIP(SQLBackedObject):
+
+    __tablename__ = 'elastic_ip'
+
+    id = Column(Integer, primary_key=True)
+    public_ip = Column(String)
 
 
 def try_n_times(fn, *args, **kwargs):

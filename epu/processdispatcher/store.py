@@ -1,6 +1,9 @@
+# Copyright 2013 University of Chicago
+
 from functools import partial
 import simplejson as json
 import logging
+import time
 import re
 import threading
 import copy
@@ -12,7 +15,8 @@ from kazoo.exceptions import NodeExistsException, BadVersionException, \
 import epu.tevent as tevent
 from epu.exceptions import NotFoundError, WriteConflictError
 from epu import zkutil
-from epu.states import ProcessDispatcherState
+from epu.states import ProcessDispatcherState, ExecutionResourceState
+from epu.util import parse_datetime
 
 log = logging.getLogger(__name__)
 
@@ -25,7 +29,9 @@ def get_processdispatcher_store(config, use_gevent=False):
 
         log.info("Using ZooKeeper ProcessDispatcher store")
         store = ProcessDispatcherZooKeeperStore(zookeeper['hosts'],
-            zookeeper['path'], zookeeper.get('timeout'))
+                                                zookeeper['path'],
+                                                zookeeper.get('timeout'),
+                                                use_gevent=use_gevent)
 
     else:
         log.info("Using in-memory ProcessDispatcher store")
@@ -661,10 +667,10 @@ class ProcessDispatcherZooKeeperStore(object):
     DOCTOR_ELECTION_PATH = "/elections/doctor"
 
     def __init__(self, hosts, base_path, username=None, password=None,
-        timeout=None, use_gevent=False):
+                 timeout=None, use_gevent=False):
 
         kwargs = zkutil.get_kazoo_kwargs(username=username, password=password,
-            timeout=timeout, use_gevent=use_gevent)
+                                         timeout=timeout, use_gevent=use_gevent)
         self.kazoo = KazooClient(hosts + base_path, **kwargs)
         self.retry = zkutil.get_kazoo_retry()
         self.matchmaker_election = self.kazoo.Election(self.MATCHMAKER_ELECTION_PATH)
@@ -720,7 +726,7 @@ class ProcessDispatcherZooKeeperStore(object):
                 allow_missing_node=True)
 
     def _initialized_watcher(self, data, stat):
-        if not (data == None and stat == None):
+        if not (data is None and stat is None):
             # initialized node exists! set our event and join the party.
             self._is_initialized.set()
             self._party.join()
@@ -731,7 +737,7 @@ class ProcessDispatcherZooKeeperStore(object):
     def _connection_state_listener(self, state):
         # called by kazoo when the connection state changes.
         # handle in background
-        state_listener = tevent.spawn(self._handle_connection_state, state)
+        tevent.spawn(self._handle_connection_state, state)
 
     def _handle_connection_state(self, state):
 
@@ -822,6 +828,10 @@ class ProcessDispatcherZooKeeperStore(object):
         self._matchmaker = None
 
         self.kazoo.stop()
+        try:
+            self.kazoo.close()
+        except Exception:
+            log.exception("Problem cleaning up kazoo")
         self._is_initialized.clear()
 
     #########################################################################
@@ -914,6 +924,8 @@ class ProcessDispatcherZooKeeperStore(object):
         """
         definition_id = definition.definition_id
         data = json.dumps(definition)
+        zkutil.check_data(data)
+
         try:
             self.retry(self.kazoo.create, self._make_definition_path(definition_id), data)
         except NodeExistsException:
@@ -939,6 +951,7 @@ class ProcessDispatcherZooKeeperStore(object):
         """
         definition_id = definition.definition_id
         data = json.dumps(definition)
+        zkutil.check_data(data)
         try:
             self.retry(self.kazoo.set,
                 self._make_definition_path(definition_id), data, -1)
@@ -985,6 +998,7 @@ class ProcessDispatcherZooKeeperStore(object):
         is raised.
         """
         data = json.dumps(process)
+        zkutil.check_data(data)
 
         try:
             self.retry(self.kazoo.create,
@@ -1011,6 +1025,7 @@ class ProcessDispatcherZooKeeperStore(object):
         """
         path = self._make_process_path(owner=process.owner, upid=process.upid)
         data = json.dumps(process)
+        zkutil.check_data(data)
         version = process.metadata.get('version')
 
         if version is None and not force:
@@ -1212,6 +1227,7 @@ class ProcessDispatcherZooKeeperStore(object):
         """
         node_id = node.node_id
         data = json.dumps(node)
+        zkutil.check_data(data)
 
         try:
             self.retry(self.kazoo.create,
@@ -1227,6 +1243,7 @@ class ProcessDispatcherZooKeeperStore(object):
         node_id = node.node_id
         path = self._make_node_path(node_id)
         data = json.dumps(node)
+        zkutil.check_data(data)
         version = node.metadata.get('version')
 
         if version is None and not force:
@@ -1299,6 +1316,7 @@ class ProcessDispatcherZooKeeperStore(object):
         """
         resource_id = resource.resource_id
         data = json.dumps(resource)
+        zkutil.check_data(data)
 
         try:
             self.retry(self.kazoo.create,
@@ -1314,6 +1332,7 @@ class ProcessDispatcherZooKeeperStore(object):
         resource_id = resource.resource_id
         path = self._make_resource_path(resource_id)
         data = json.dumps(resource)
+        zkutil.check_data(data)
         version = resource.metadata.get('version')
 
         if version is None and not force:
@@ -1434,12 +1453,25 @@ class ProcessRecord(Record):
             conf = {}
 
         starts = 0
+        start_times = []
+        dispatches = 0
+        dispatch_times = []
         d = dict(owner=owner, upid=upid, subscribers=subscribers, state=state,
                  round=int(round), definition=definition, configuration=conf,
                  constraints=const, assigned=assigned, hostname=hostname,
                  queueing_mode=queueing_mode, restart_mode=restart_mode,
-                 starts=starts, node_exclusive=node_exclusive, name=name)
+                 starts=starts, node_exclusive=node_exclusive, name=name,
+                 start_times=start_times, dispatches=dispatches,
+                 dispatch_times=dispatch_times)
         return cls(d)
+
+    def increment_starts(self):
+        self.starts += 1
+        self.start_times.append(time.time())
+
+    def increment_dispatches(self):
+        self.dispatches += 1
+        self.dispatch_times.append(time.time())
 
     def get_key(self):
         return self.owner, self.upid, self.round
@@ -1455,7 +1487,7 @@ class ProcessRecord(Record):
 class ResourceRecord(Record):
     @classmethod
     def new(cls, resource_id, node_id, slot_count, properties=None,
-            enabled=True):
+            state=ExecutionResourceState.OK, last_heartbeat=None):
         if properties:
             props = properties.copy()
         else:
@@ -1464,9 +1496,19 @@ class ResourceRecord(Record):
         # Special case to allow matching against resource_id
         props['resource_id'] = resource_id
 
-        d = dict(resource_id=resource_id, node_id=node_id, enabled=enabled,
-                 slot_count=int(slot_count), properties=props, assigned=[])
+        d = dict(resource_id=resource_id, node_id=node_id, state=state,
+                 slot_count=int(slot_count), properties=props, assigned=[],
+                 last_heartbeat=last_heartbeat)
         return cls(d)
+
+    @property
+    def last_heartbeat_datetime(self):
+        if self.last_heartbeat is None:
+            return None
+        return parse_datetime(self.last_heartbeat)
+
+    def new_last_heartbeat_datetime(self, d):
+        self.last_heartbeat = d.isoformat()
 
     @property
     def available_slots(self):
@@ -1482,7 +1524,7 @@ class ResourceRecord(Record):
 
 class NodeRecord(Record):
     @classmethod
-    def new(cls, node_id, domain_id, properties=None, resources=None):
+    def new(cls, node_id, domain_id, properties=None, resources=None, state_time=None):
         if properties:
             props = properties.copy()
         else:
@@ -1494,7 +1536,7 @@ class NodeRecord(Record):
             res = []
 
         d = dict(node_id=node_id, domain_id=domain_id, properties=props,
-            resources=res, node_exclusive=[])
+            resources=res, node_exclusive=[], state_time=time.time())
         return cls(d)
 
     def node_exclusive_available(self, attr):
