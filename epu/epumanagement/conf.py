@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 # Confs for the Neediness API constraints
 
 CONF_IAAS_SITE = "iaas_site"
@@ -18,6 +20,7 @@ EPUM_INITIALCONF_DEFAULT_NEEDY_IAAS_ALLOC = "needy_default_iaas_allocation"
 EPUM_CONF_GENERAL = "general"
 EPUM_CONF_ENGINE_CLASS = "engine_class"
 EPUM_CONF_ENGINE = "engine_conf"
+EPUM_CONF_CHEF_CREDENTIAL = "chef_credential"
 EPUM_CONF_HEALTH = "health"
 EPUM_CONF_HEALTH_MONITOR = "monitor_health"
 EPUM_CONF_HEALTH_BOOT = "boot_timeout"

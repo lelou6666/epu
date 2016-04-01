@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import uuid
 from socket import timeout
@@ -163,7 +165,6 @@ class HighAvailabilityServiceClient(object):
     def reconfigure_policy(self, new_policy):
         """Service operation: Change policy
         """
-        log.debug('reconfigure_policy: %s' % new_policy)
         self.dashi.call(self.topic, "reconfigure_policy", new_policy=new_policy)
 
     def status(self):

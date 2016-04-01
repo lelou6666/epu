@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import time
 import simplejson as json
@@ -343,6 +345,7 @@ class DomainStore(object):
                 return True
             # instance was probably a duplicate
             return False
+        return False
 
     def mark_instance_terminating(self, instance_id):
         """Mark an instance for termination
@@ -1013,7 +1016,14 @@ class ZooKeeperEPUMStore(EPUMStore):
 
     def shutdown(self):
         self.kazoo.stop()
+<<<<<<< HEAD
         self.kazoo.close()
+=======
+        try:
+            self.kazoo.close()
+        except Exception:
+            log.exception("Problem cleaning up kazoo")
+>>>>>>> refs/remotes/nimbusproject/master
 
     def _connection_state_listener(self, state):
         # called by kazoo when the connection state changes.

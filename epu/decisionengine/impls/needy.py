@@ -197,9 +197,13 @@ class NeedyEngine(Engine):
                 extravars = {self.unique_key: None}
 
             while valid_count < self.preserve_n:
-                # if we run out of uniques, we start using None
+                # if we run out of uniques, complain
                 if self.unique_key:
-                    extravars[self.unique_key] = next(next_uniques, None)
+                    try:
+                        extravars[self.unique_key] = next(next_uniques)
+                    except StopIteration:
+                        log.error("Ran out of unique '%s' values. Can't start more VMs" % self.unique_key)
+                        break
 
                 self._launch_one(control, extravars=extravars)
                 valid_count += 1
@@ -229,8 +233,6 @@ class NeedyEngine(Engine):
     def _launch_one(self, control, extravars=None):
         if not self.iaas_site:
             raise Exception("No IaaS site configuration")
-        if not self.iaas_allocation:
-            raise Exception("No IaaS allocation configuration")
         if not self.deployable_type:
             raise Exception("No deployable type configuration")
         launch_id, instance_ids = control.launch(self.deployable_type,

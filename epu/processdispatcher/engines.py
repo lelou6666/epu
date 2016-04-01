@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import logging
 
 from epu.util import ensure_timedelta
@@ -122,11 +124,13 @@ _DEFAULT_HEARTBEAT_PERIOD = 30
 class EngineSpec(object):
     def __init__(self, engine_id, slots, base_need=0, config=None, replicas=1,
                  spare_slots=0, iaas_allocation=None, maximum_vms=None,
-                 heartbeat_period=30, heartbeat_warning=45, heartbeat_missing=60):
+                 heartbeat_period=30, heartbeat_warning=45, heartbeat_missing=60,
+                 deployable_type=None):
         self.engine_id = engine_id
         self.config = config
         self.base_need = int(base_need)
         self.iaas_allocation = iaas_allocation
+        self.deployable_type = deployable_type
 
         slots = int(slots)
         if slots < 1:

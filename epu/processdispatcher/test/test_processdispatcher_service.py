@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import unittest
 from collections import defaultdict
@@ -7,7 +9,7 @@ import uuid
 import threading
 from socket import timeout
 
-
+from mock import patch
 from dashi import bootstrap, DashiConnection
 
 import epu.tevent as tevent
@@ -32,7 +34,10 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
     amqp_uri = "amqp://guest:guest@127.0.0.1//"
 
     engine_conf = {'engine1': {'slots': 4, 'base_need': 1},
-                   'engine2': {'slots': 4}, 'engine3': {'slots': 4}}
+                   'engine2': {'slots': 4}, 'engine3': {'slots': 4},
+                   'engine4': {
+                       'slots': 4, 'heartbeat_warning': 10, 'heartbeat_missing': 20,
+                       'heartbeat_period': 1, 'base_need': 1}}
     default_engine = 'engine1'
     process_engines = {'a.b.C': 'engine3', 'a.b': 'engine2'}
 
@@ -86,7 +91,7 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
 
         self.pd_name = self.pd.topic
         self.pd_thread = tevent.spawn(self.pd.start)
-        self.pd.ready_event.wait()
+        self.pd.ready_event.wait(60)
 
     def stop_pd(self):
         self.pd.stop()
@@ -1281,7 +1286,7 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
         restart_mode = RestartMode.ALWAYS
 
         default_time_to_throttle = 2
-        time_to_throttle = 5
+        time_to_throttle = 10
 
         self.client.schedule_process("proc1", self.process_definition_id,
             constraints=constraints, queueing_mode=queueing_mode,
@@ -1589,6 +1594,96 @@ class ProcessDispatcherServiceTests(unittest.TestCase):
         p5 = self.client.describe_process("p5")
         states = set([p2['state'], p5['state']])
         self.assertEqual(states, set([ProcessState.RUNNING, ProcessState.WAITING]))
+
+    def test_missing_ee(self):
+        """test_missing_ee
+
+        Ensure that the PD kills lingering processes on eeagents after they've been
+        evacuated.
+        """
+
+        # create some fake nodes and tell PD about them
+        node_1 = "node1"
+        domain_id = domain_id_from_engine("engine4")
+        self.client.node_state(node_1, domain_id, InstanceState.RUNNING)
+
+        # PD knows about this node but hasn't gotten a heartbeat yet
+
+        # spawn the eeagents and tell them all to heartbeat
+        eeagent_1 = self._spawn_eeagent(node_1, 1)
+
+        def assert_all_resources(state):
+            eeagent_nodes = set()
+            for resource in state['resources'].itervalues():
+                eeagent_nodes.add(resource['node_id'])
+            self.assertEqual(set([node_1]), eeagent_nodes)
+
+        self._wait_assert_pd_dump(assert_all_resources)
+        time_to_throttle = 0
+
+        self.client.schedule_process("p1", self.process_definition_id, execution_engine_id="engine4",
+            configuration=minimum_time_between_starts_config(time_to_throttle))
+
+        # Send a heartbeat to show the process is RUNNING, then wait for doctor
+        # to mark the eeagent missing
+        time.sleep(1)
+        eeagent_1.send_heartbeat()
+        self.notifier.wait_for_state('p1', ProcessState.RUNNING, timeout=30)
+        self.notifier.wait_for_state('p1', ProcessState.WAITING, timeout=30)
+
+        # Check that process is still 'Running' on the eeagent, even the PD has
+        # since marked it failed
+        eeagent_process = eeagent_1._get_process_with_upid('p1')
+        self.assertEqual(eeagent_process['u_pid'], 'p1')
+        self.assertEqual(eeagent_process['state'], ProcessState.RUNNING)
+        self.assertEqual(eeagent_process['round'], 0)
+
+        # Now send another heartbeat to start getting procs again
+        eeagent_1.send_heartbeat()
+        self.notifier.wait_for_state('p1', ProcessState.RUNNING, timeout=30)
+
+        eeagent_process = eeagent_1._get_process_with_upid('p1')
+        self.assertEqual(eeagent_process['u_pid'], 'p1')
+        self.assertEqual(eeagent_process['state'], ProcessState.RUNNING)
+        self.assertEqual(eeagent_process['round'], 1)
+
+        # The pd should now have rescheduled the proc, and terminated the
+        # lingering process
+        self.assertEqual(len(eeagent_1.history), 1)
+        terminated_history = eeagent_1.history[0]
+        self.assertEqual(terminated_history['u_pid'], 'p1')
+        self.assertEqual(terminated_history['state'], ProcessState.TERMINATED)
+        self.assertEqual(terminated_history['round'], 0)
+
+    def test_matchmaker_msg_retry(self):
+        node = "node1"
+        domain_id = domain_id_from_engine('engine1')
+        self.client.node_state(node, domain_id, InstanceState.RUNNING)
+        self._spawn_eeagent(node, 1)
+
+        # sneak in and shorten retry time
+        self.pd.matchmaker.process_launcher.retry_seconds = 0.5
+
+        proc1 = "proc1"
+        proc2 = "proc2"
+
+        with patch.object(self.pd.matchmaker.process_launcher, "resource_client") as mock_resource_client:
+            # first process request goes to mock, not real client but no error
+            self.client.schedule_process(proc1, self.process_definition_id)
+
+            # second process hits an error but that should not cause problems
+            mock_resource_client.launch_process.side_effect = Exception("boom!")
+            self.client.schedule_process(proc2, self.process_definition_id)
+
+            self._wait_assert_pd_dump(self._assert_process_states,
+                                      ProcessState.ASSIGNED, [proc1, proc2])
+            self.assertEqual(mock_resource_client.launch_process.call_count, 2)
+
+        # now resource client works again. those messages should be retried
+        self.notifier.wait_for_state(proc1, ProcessState.RUNNING)
+        self.notifier.wait_for_state(proc2, ProcessState.RUNNING)
+        self._wait_assert_pd_dump(self._assert_process_states,
+                                  ProcessState.RUNNING, [proc1, proc2])
 
 
 class ProcessDispatcherServiceZooKeeperTests(ProcessDispatcherServiceTests, ZooKeeperTestMixin):

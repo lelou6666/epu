@@ -1,20 +1,20 @@
-#!/usr/bin/env python
+# Copyright 2013 University of Chicago
+
 
 """
 @file epu/provisioner/test/test_provisioner_service.py
 @author David LaBissoniere
 @brief Test provisioner behavior
 """
-import dashi.bootstrap as bootstrap
-from dashi import DashiConnection
-
 import time
 import uuid
 import unittest
 import logging
 
+import dashi.bootstrap as bootstrap
 import epu.tevent as tevent
 
+from dashi import DashiConnection
 from epu.dashiproc.dtrs import DTRS
 from epu.dashiproc.provisioner import ProvisionerClient, ProvisionerService
 from epu.provisioner.ctx import BrokerError
@@ -137,8 +137,19 @@ class BaseProvisionerServiceTests(unittest.TestCase):
             }
         }
 
+        dt3 = {
+            'mappings': {
+                'fake-site1': {
+                    'iaas_image': '${image_id}',
+                    'iaas_allocation': 'm1.small',
+                    'needs_elastic_ip': True
+                }
+            }
+        }
+
         self.dtrs.add_dt(caller, "empty", dt1)
         self.dtrs.add_dt(caller, "empty-with-vars", dt2)
+        self.dtrs.add_dt(caller, "needs-elastic", dt3)
 
     def tearDown(self):
         self.shutdown_procs()
@@ -188,6 +199,22 @@ class ProvisionerServiceTest(BaseProvisionerServiceTests):
 
         self.assertStoreNodeRecords(InstanceState.FAILED, *node_ids)
         self.assertStoreLaunchRecord(InstanceState.FAILED, launch_id)
+
+    def test_provision_with_elastic_ip(self):
+        client = self.client
+        caller = 'asterix'
+
+        deployable_type = 'needs-elastic'
+        launch_id = _new_id()
+
+        node_ids = [_new_id()]
+
+        vars = {'image_id': 'fake-image'}
+        client.provision(launch_id, node_ids, deployable_type,
+            'fake-site1', vars=vars, caller=caller)
+        self.notifier.wait_for_state(InstanceState.PENDING, node_ids,
+            before=self.provisioner.leader._force_cycle)
+        self.assertStoreNodeRecords(InstanceState.PENDING, *node_ids)
 
     def test_provision_with_vars(self):
         client = self.client
@@ -373,10 +400,10 @@ class ProvisionerServiceTest(BaseProvisionerServiceTests):
                 site="fake-site1", caller="asterix")
 
         self.notifier.wait_for_state(InstanceState.TERMINATED, all_node_ids,
-            before=self.provisioner.leader._force_cycle)
+            before=self.provisioner.leader._force_cycle, timeout=240)
         self.assertStoreNodeRecords(InstanceState.TERMINATED, *all_node_ids)
 
-        self.notifier.wait_for_state(InstanceState.REJECTED, rejected_node_ids)
+        self.notifier.wait_for_state(InstanceState.REJECTED, rejected_node_ids, timeout=240)
         self.assertStoreNodeRecords(InstanceState.REJECTED, *rejected_node_ids)
 
         self.assertEqual(len(self.driver.destroyed),
@@ -393,7 +420,7 @@ class ProvisionerServiceTest(BaseProvisionerServiceTests):
             site="fake-site1", caller="asterix")
 
         self.notifier.wait_for_state(InstanceState.PENDING, [node_id],
-            before=self.provisioner.leader._force_cycle)
+            before=self.provisioner.leader._force_cycle, timeout=60)
         self.assertStoreNodeRecords(InstanceState.PENDING, node_id)
 
     def test_describe(self):
@@ -490,6 +517,9 @@ class ProvisionerServiceTest(BaseProvisionerServiceTests):
         self.store.add_launch(launch2)
         for node in nodes2:
             self.store.add_node(node)
+
+        # Wait a second for record to get written
+        time.sleep(1)
 
         # Force a record reaping cycle
         self.provisioner.leader._force_record_reaping()

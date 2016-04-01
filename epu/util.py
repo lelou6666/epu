@@ -1,16 +1,18 @@
+# Copyright 2013 University of Chicago
+
 import os
 import sys
 import string
 import numbers
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from epu import rfc3339
 
 from epu.exceptions import UserNotPermittedError
 
 
-# -_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
-_VALID = "-_%s%s" % (string.ascii_letters, string.digits)
+# .-_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+_VALID = ".-_%s%s" % (string.ascii_letters, string.digits)
 _VALID_SET = frozenset(_VALID)
 
 

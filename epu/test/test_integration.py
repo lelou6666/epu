@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import os
 import time
 import uuid
@@ -72,7 +74,7 @@ example_dt = {
             'iaas_allocation': 'm1.large',
         },
         'ec2-fake': {
-            'iaas_image': 'ami-fake',
+            'iaas_image': 'xxami-fake',
             'iaas_allocation': 't1.micro',
         }
     },
@@ -419,7 +421,7 @@ class TestEPUMZKIntegration(unittest.TestCase, TestFixture, ZooKeeperTestMixin):
         nodes = self.libcloud.list_nodes(immediate=True)
         return [node for node in nodes if node.state != NodeState.TERMINATED]
 
-    def wait_for_libcloud_nodes(self, count, timeout=60):
+    def wait_for_libcloud_nodes(self, count, timeout=120):
         wait(lambda: len(self.get_valid_libcloud_nodes()) == count,
             timeout=timeout)
         return self.get_valid_libcloud_nodes()
@@ -429,7 +431,7 @@ class TestEPUMZKIntegration(unittest.TestCase, TestFixture, ZooKeeperTestMixin):
         wait(lambda: set(self.epum_client.list_domains()) == expected,
             timeout=timeout)
 
-    def wait_for_all_domains(self, timeout=30):
+    def wait_for_all_domains(self, timeout=120):
         wait(self.verify_all_domain_instances, timeout=timeout)
 
     def verify_all_domain_instances(self):
@@ -485,8 +487,8 @@ class TestEPUMZKIntegration(unittest.TestCase, TestFixture, ZooKeeperTestMixin):
         self.wait_for_all_domains()
 
         # and more instances
-        self.epum_client.reconfigure_domain("dom1", self._get_reconfigure_n(100))
-        self.wait_for_libcloud_nodes(100)
+        self.epum_client.reconfigure_domain("dom1", self._get_reconfigure_n(50))
+        self.wait_for_libcloud_nodes(50)
         self.wait_for_all_domains()
 
         # and less
@@ -634,7 +636,7 @@ dt_registries:
 """
 
 
-class TestProvisionerIntegration(unittest.TestCase, TestFixture):
+class TestProvisionerIntegrationLowTimeout(unittest.TestCase, TestFixture):
 
     def setUp(self):
 
@@ -664,7 +666,8 @@ class TestProvisionerIntegration(unittest.TestCase, TestFixture):
             print "Using fake site"
             # Set up fake libcloud and start deployment
             self.site_name = "ec2-fake"
-            self.site, self.libcloud = self.make_fake_libcloud_site(self.site_name)
+            self.site, self.libcloud = self.make_fake_libcloud_site(self.site_name, needs_elastic_ip=True)
+            print "FAKE"
             self.credentials = fake_credentials
 
         self.setup_harness(exchange=self.exchange, sysname=self.sysname)

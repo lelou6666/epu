@@ -1,10 +1,10 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import time
 
 from dashi import bootstrap, DashiError
 from dashi.exceptions import BadRequestError as DashiBadRequestError
-from dashi.exceptions import NotFoundError as DashiNotFoundError
-from dashi.exceptions import WriteConflictError as DashiWriteConflictError
 
 from epu.exceptions import SiteDefinitionValidationError
 
@@ -13,9 +13,9 @@ try:
 except ImportError:
     StatsClient = None
 
-from epu.dtrs.core import DTRSCore
+from epu.dtrs.core import DTRSCore, CredentialType
 from epu.dtrs.store import get_dtrs_store
-from epu.exceptions import DeployableTypeLookupError, DeployableTypeValidationError, NotFoundError, WriteConflictError
+from epu.exceptions import DeployableTypeLookupError, DeployableTypeValidationError
 from epu.util import get_config_paths
 import epu.dashiproc
 
@@ -48,12 +48,9 @@ class DTRS(object):
 
         log.info("starting DTRS instance %s" % self)
 
+        epu.dashiproc.link_dashi_exceptions(self.dashi)
         self.dashi.link_exceptions(custom_exception=SiteDefinitionValidationError,
                                    dashi_exception=DashiBadRequestError)
-        self.dashi.link_exceptions(custom_exception=NotFoundError,
-                                   dashi_exception=DashiNotFoundError)
-        self.dashi.link_exceptions(custom_exception=WriteConflictError,
-                                   dashi_exception=DashiWriteConflictError)
 
         self.dashi.handle(self.add_dt)
         self.dashi.handle(self.describe_dt)
@@ -117,26 +114,40 @@ class DTRS(object):
 
     # Credentials
 
-    def add_credentials(self, caller, site_name, site_credentials):
-        return self.core.add_credentials(caller, site_name, site_credentials)
+    # note: credential_type was added afterwards. kept at the end, and with a default value to
+    # avoid breaking existing code. also left site_name argument unchanged, even though it is
+    # just "name" elsewhere in the DTRS.
 
-    def describe_credentials(self, caller, site_name):
-        return self.core.describe_credentials(caller, site_name)
+    def add_credentials(self, caller, site_name, site_credentials, credential_type=CredentialType.SITE):
+        # Above function signature kept for backward compatibility
+        name = site_name
+        credentials = site_credentials
+        return self.core.add_credentials(caller, credential_type, name, credentials)
 
-    def list_credentials(self, caller):
-        return self.core.store.list_credentials(caller)
+    def describe_credentials(self, caller, site_name, credential_type=CredentialType.SITE):
+        # Above function signature kept for backward compatibility
+        name = site_name
+        return self.core.describe_credentials(caller, credential_type, name)
 
-    def remove_credentials(self, caller, site_name):
-        return self.core.store.remove_credentials(caller, site_name)
+    def list_credentials(self, caller, credential_type=CredentialType.SITE):
+        return self.core.store.list_credentials(caller, credential_type)
 
-    def update_credentials(self, caller, site_name, site_credentials):
-        return self.core.store.update_credentials(caller, site_name,
-                                                  site_credentials)
+    def remove_credentials(self, caller, site_name, credential_type=CredentialType.SITE):
+        # Above function signature kept for backward compatibility
+        name = site_name
+        return self.core.store.remove_credentials(caller, credential_type, name)
+
+    def update_credentials(self, caller, site_name, site_credentials, credential_type=CredentialType.SITE):
+        # Above function signature kept for backward compatibility
+        name = site_name
+        credentials = site_credentials
+        return self.core.store.update_credentials(caller, credential_type, name, credentials)
 
     # Old DTRS methods - keeping the API unmodified for now
 
     def lookup(self, caller, dt_name, dtrs_request_node, vars):
         return self.core.lookup(caller, dt_name, dtrs_request_node, vars)
+
 
 def statsd(func):
     def call(dtrs_client, *args, **kwargs):
@@ -218,30 +229,35 @@ class DTRSClient(object):
                                caller=caller)
 
     @statsd
-    def add_credentials(self, caller, site_name, site_credentials):
+    def add_credentials(self, caller, site_name, site_credentials, credential_type=CredentialType.SITE):
         return self.dashi.call(self.topic, 'add_credentials', caller=caller,
                                site_name=site_name,
-                               site_credentials=site_credentials)
+                               site_credentials=site_credentials,
+                               credential_type=credential_type)
 
     @statsd
-    def describe_credentials(self, caller, site_name):
+    def describe_credentials(self, caller, site_name, credential_type=CredentialType.SITE):
         return self.dashi.call(self.topic, 'describe_credentials',
-                               caller=caller, site_name=site_name)
+                               caller=caller, site_name=site_name,
+                               credential_type=credential_type)
 
     @statsd
-    def list_credentials(self, caller):
-        return self.dashi.call(self.topic, 'list_credentials', caller=caller)
+    def list_credentials(self, caller, credential_type=CredentialType.SITE):
+        return self.dashi.call(self.topic, 'list_credentials', caller=caller,
+                               credential_type=credential_type)
 
     @statsd
-    def remove_credentials(self, caller, site_name):
+    def remove_credentials(self, caller, site_name, credential_type=CredentialType.SITE):
         return self.dashi.call(self.topic, 'remove_credentials', caller=caller,
-                               site_name=site_name)
+                               site_name=site_name,
+                               credential_type=credential_type)
 
     @statsd
-    def update_credentials(self, caller, site_name, site_credentials):
+    def update_credentials(self, caller, site_name, site_credentials, credential_type=CredentialType.SITE):
         return self.dashi.call(self.topic, 'update_credentials', caller=caller,
                                site_name=site_name,
-                               site_credentials=site_credentials)
+                               site_credentials=site_credentials,
+                               credential_type=credential_type)
 
     # Old DTRS methods - keeping the API unmodified for now
 

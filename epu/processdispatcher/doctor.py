@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import threading
 import heapq
@@ -58,8 +60,17 @@ class PDDoctor(object):
         """
         with self.condition:
             if self.is_leader:
-                raise Exception("already the leader???")
+                raise Exception("Elected as Doctor but already initialized. This worker is in an inconsistent state!")
+
+        try:
             self.is_leader = True
+
+            self._initialize()
+        finally:
+            # ensure flag is cleared in case of error
+            self.is_leader = False
+
+    def _initialize(self):
 
         pd_state = self.store.get_pd_state()
         log.info("Elected as Process Dispatcher Doctor. State is %s", pd_state)
@@ -81,7 +92,8 @@ class PDDoctor(object):
                 self.condition.wait()
 
         log.debug("Waiting on monitor thread to exit")
-        self.monitor_thread.join()
+        if self.monitor_thread is not None:
+            self.monitor_thread.join()
         self.monitor = None
         self.monitor_thread = None
 

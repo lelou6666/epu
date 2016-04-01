@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import threading
 import logging
 import time
@@ -75,6 +77,9 @@ class ProvisionerService(object):
         iaas_timeout = kwargs.get('iaas_timeout')
         iaas_timeout = iaas_timeout or self.CFG.provisioner.get('iaas_timeout')
 
+        instance_ready_timeout = kwargs.get('instance_ready_timeout')
+        instance_ready_timeout = instance_ready_timeout or self.CFG.provisioner.get('instance_ready_timeout')
+
         record_reaping_max_age = kwargs.get('record_reaping_max_age')
         record_reaping_max_age = record_reaping_max_age or self.CFG.provisioner.get('record_reaping_max_age')
 
@@ -82,7 +87,7 @@ class ProvisionerService(object):
         core = core or self._get_core()
 
         self.core = core(self.store, self.notifier, self.dtrs, context_client,
-                iaas_timeout=iaas_timeout, statsd_cfg=statsd_cfg)
+                iaas_timeout=iaas_timeout, statsd_cfg=statsd_cfg, instance_ready_timeout=instance_ready_timeout)
 
         leader = kwargs.get('leader')
         self.leader = leader or ProvisionerLeader(self.store, self.core,
@@ -93,6 +98,8 @@ class ProvisionerService(object):
     def start(self):
 
         log.info("starting provisioner instance %s" % self)
+
+        epu.dashiproc.link_dashi_exceptions(self.dashi)
 
         # Set up operations
         self.dashi.handle(self.provision)
@@ -151,10 +158,10 @@ class ProvisionerService(object):
         caller = caller or self.default_user
 
         launch, nodes = self.core.prepare_provision(launch_id, deployable_type,
-            instance_ids, site, allocation, vars, caller)
+            instance_ids, site, allocation, vars, caller=caller)
 
         if launch['state'] < InstanceState.FAILED:
-            self.core.execute_provision(launch, nodes, caller)
+            self.core.execute_provision(launch, nodes, caller=caller)
         else:
             log.warn("Launch %s couldn't be prepared, not executing",
                 launch['launch_id'])
@@ -249,7 +256,8 @@ def statsd(func):
         if provisioner_client.statsd_client is not None:
             try:
                 client_name = provisioner_client.client_name or "provisioner_client"
-                provisioner_client.statsd_client.timing('%s.%s.timing' % (client_name, func.__name__), (after - before) * 1000)
+                provisioner_client.statsd_client.timing(
+                    '%s.%s.timing' % (client_name, func.__name__), (after - before) * 1000)
                 provisioner_client.statsd_client.incr('%s.%s.count' % (client_name, func.__name__))
             except:
                 log.exception("Failed to submit metrics")
@@ -277,7 +285,7 @@ class ProvisionerClient(object):
     def terminate_nodes(self, nodes, caller=None):
         """Service operation: Terminate one or more nodes
         """
-        log.debug('op_terminate_nodes nodes:' + str(nodes))
+        log.debug("op_terminate_nodes nodes:" + str(nodes))
         self.dashi.fire(self.topic, "terminate_nodes", nodes=nodes, caller=caller)
 
     @statsd
@@ -301,7 +309,7 @@ class ProvisionerClient(object):
 
     @statsd
     def dump_state(self, nodes=None, force_subscribe=None):
-        log.debug('Sending dump_state request to provisioner')
+        log.debug("Sending dump_state request to provisioner")
         self.dashi.fire(self.topic, 'dump_state', nodes=nodes)
 
     @statsd
@@ -336,7 +344,7 @@ class ProvisionerNotifier(object):
         sanitize_record(record)
 
         subscribers = self.subscribers
-        log.debug('Sending state %s record for node %s to %s',
+        log.debug("Sending state %s record for node %s to %s",
                 record['state'], record['node_id'], repr(subscribers))
         if subscribers:
             for sub in subscribers:

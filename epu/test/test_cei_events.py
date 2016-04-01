@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import unittest
 import datetime
 import logging
@@ -43,13 +45,11 @@ class CEIEventsTestCase(unittest.TestCase):
         finally:
             if f:
                 f.close()
-
         logfilehandler = logging.FileHandler(logfilepath)
         logfilehandler.setLevel(logging.DEBUG)
         formatstring = "%(asctime)s %(levelname)s @%(lineno)d: %(message)s"
         logfilehandler.setFormatter(logging.Formatter(formatstring))
         self.log.addHandler(logfilehandler)
-
         self.logfilehandler = logfilehandler
         self.logfilepath = logfilepath
         self.logdirpath = tmpdir
@@ -61,8 +61,6 @@ class CEIEventsTestCase(unittest.TestCase):
         except:
             pass
         return False
-
-    # -----------------------------------------------------------------------
 
     def test_event_write(self):
         self.log.debug("something")
@@ -77,8 +75,8 @@ class CEIEventsTestCase(unittest.TestCase):
         cruft = "some cruft %s" % cei_events.event_logtxt("unittest", "TRIAL1")
         self.log.warning(cruft)
         events = cei_events.events_from_file(self.logfilepath)
-        assert len(events) == 1
 
+        assert len(events) == 1
         cei_events.event("unittest", "TRIAL2", self.log)
         events = cei_events.events_from_file(self.logfilepath)
         assert len(events) == 2
@@ -102,7 +100,6 @@ class CEIEventsTestCase(unittest.TestCase):
         events = cei_events.events_from_file(self.logfilepath)
         assert len(events) == 1
         ts = events[0].timestamp
-
         # It is possible that any of these values could have rolled over
         # between acquiring utc_now and recording the event.  But this is
         # unlikely enough that we'll keep this important UTC sanity check:
@@ -134,8 +131,7 @@ class CEIEventsTestCase(unittest.TestCase):
         assert events[0].extra["hello1"] == "hello2"
 
     def test_bad_extra(self):
-        self.assertRaises(Exception, cei_events.event,
-                          "unittest", "TRIAL1", self.log, extra="astring")
+        self.assertRaises(Exception, cei_events.event, "unittest", "TRIAL1", self.log, extra="astring")
 
     def test_extra_integer_values(self):
         adict = {"hello1": 34}
@@ -144,50 +140,30 @@ class CEIEventsTestCase(unittest.TestCase):
         assert len(events) == 1
         assert events[0].extra["hello1"] == 34
 
-    def test_extra_integer_keys(self):
-        # This does not serialize as an integer, fails.  Added rule
-        # to events recorder to not allow integer keys.
-        pass
-        # adict = {23:"something"}
-        # cei_events.event("unittest", "TRIAL1", self.log, extra=adict)
-        # events = cei_events.events_from_file(self.logfilepath)
-        # assert len(events) == 1
-        # assert events[0].extra[23] == "something"
-
     def test_extra_hierarchy(self):
         # note the conflicting "hello3" key in higher level:
         innerdict = {"hello3": "hello4"}
         adict = {"hello1": "hello2", "hello5": innerdict, "hello3": "hello6"}
-
         cei_events.event("unittest", "TRIAL1", self.log, extra=adict)
         events = cei_events.events_from_file(self.logfilepath)
-        assert len(events) == 1
-        assert events[0].extra["hello1"] == "hello2"
-        assert events[0].extra["hello3"] == "hello6"
-
-        innerdict = events[0].extra["hello5"]
+        event = events[0]
+        assert event.extra["hello1"] == "hello2"
+        assert event.extra["hello3"] == "hello6"
+        innerdict = event.extra["hello5"]
         assert isinstance(innerdict, dict)
         assert innerdict["hello3"] == "hello4"
 
     def test_newline_rules(self):
-        self.assertRaises(Exception, cei_events.event,
-                          "unit\ntest", "TRIAL", self.log)
-        self.assertRaises(Exception, cei_events.event,
-                          "unittest", "TRIAL\nA", self.log)
-        self.assertRaises(Exception, cei_events.event,
-                          "unittest", "TRIAL", self.log, extra="some\nthing")
-        self.assertRaises(Exception, cei_events.event,
-                          "unittest\n", "TRIAL", self.log)
-        self.assertRaises(Exception, cei_events.event,
-                          "\nunittest", "TRIAL", self.log)
-        self.assertRaises(Exception, cei_events.event,
-                          "\n", "TRIAL", self.log)
+        self.assertRaises(Exception, cei_events.event, "unit\ntest", "TRIAL", self.log)
+        self.assertRaises(Exception, cei_events.event, "unittest", "TRIAL\nA", self.log)
+        self.assertRaises(Exception, cei_events.event, "unittest", "TRIAL", self.log, extra="some\nthing")
+        self.assertRaises(Exception, cei_events.event, "unittest\n", "TRIAL", self.log)
+        self.assertRaises(Exception, cei_events.event, "\nunittest", "TRIAL", self.log)
+        self.assertRaises(Exception, cei_events.event, "\n", "TRIAL", self.log)
 
     def test_missing_rules(self):
-        self.assertRaises(Exception, cei_events.event,
-                          None, "TRIAL", self.log)
-        self.assertRaises(Exception, cei_events.event,
-                          "unittest", None, self.log)
+        self.assertRaises(Exception, cei_events.event, None, "TRIAL", self.log)
+        self.assertRaises(Exception, cei_events.event, "unittest", None, self.log)
 
     def test_event_namefilter(self):
         cei_events.event("unittest", "NM1", self.log)

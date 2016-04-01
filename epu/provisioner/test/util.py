@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 
 #!/usr/bin/env python
 
@@ -9,12 +11,13 @@
 import uuid
 import threading
 import time
+from collections import defaultdict
 
 from libcloud.compute.base import NodeDriver, Node, NodeSize
 from libcloud.compute.types import NodeState
+from mock import Mock
 
 from epu.provisioner.ctx import ContextResource
-from epu.test import Mock
 from epu.states import InstanceState
 
 import dashi.bootstrap
@@ -27,7 +30,7 @@ class FakeDTRS(object):
         self.result = None
         self.error = None
         self.sites = {}
-        self.credentials = {}
+        self.credentials = defaultdict(dict)
 
     def lookup(self, caller, dt, node=None, vars=None):
         if self.error is not None:
@@ -38,15 +41,23 @@ class FakeDTRS(object):
 
         raise Exception("bad fixture: nothing to return")
 
-    def describe_site(self, site_name):
-        if site_name in self.sites:
-            return self.sites[site_name]
+    def describe_site(self, site_name, caller=None):
+        # Check first if a user-specific site exists
+        if caller is not None:
+            caller_sites = self.sites.get(caller, [])
+            if site_name in caller_sites:
+                return caller_sites[site_name]
 
-        raise Exception("bad fixture: nothing to return for site %s" % site_name)
+        # Then try the public sites (under the None key)
+        if site_name in self.sites[None]:
+            return self.sites[None][site_name]
 
-    def describe_credentials(self, caller, site_name):
-        if (caller, site_name) in self.credentials:
-            return self.credentials[(caller, site_name)]
+        raise Exception("bad fixture: nothing to return for caller %s and site %s" % (caller, site_name))
+
+    def describe_credentials(self, caller, site_name, credential_type="site"):
+        credentials = self.credentials[credential_type]
+        if (caller, site_name) in credentials:
+            return credentials[(caller, site_name)]
 
         raise Exception("bad fixture: nothing to return")
 
@@ -77,19 +88,19 @@ class FakeProvisionerNotifier(object):
             old_record = self.nodes[node_id]
             old_state = old_record['state']
             if old_state == state:
-                log.debug('Got dupe state for node %s: %s', node_id, state)
+                log.debug("Got dupe state for node %s: %s", node_id, state)
             elif old_state < state:
                 self.nodes[node_id] = record
                 self.nodes_rec_count[node_id] += 1
-                log.debug('Got updated state record for node %s: %s -> %s',
+                log.debug("Got updated state record for node %s: %s -> %s",
                         node_id, old_state, state)
             else:
-                log.debug('Got out-of-order record for node %s. %s -> %s',
+                log.debug("Got out-of-order record for node %s. %s -> %s",
                         node_id, old_state, state)
         else:
             self.nodes[node_id] = record
             self.nodes_rec_count[node_id] = 1
-            log.debug('Recorded new state record for node %s: %s',
+            log.debug("Recorded new state record for node %s: %s",
                     node_id, state)
 
     def send_records(self, records, operation='node_status'):
@@ -163,7 +174,7 @@ class FakeProvisionerNotifier(object):
             if timeout and time.time() - start_time >= timeout:
                 raise Exception("timeout before state reached")
 
-        log.debug('All nodes in %s state', state)
+        log.debug("All nodes in %s state", state)
         return win
 
 
