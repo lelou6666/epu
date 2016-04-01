@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import unittest
 import time
@@ -74,7 +76,7 @@ class DTRSTests(unittest.TestCase):
         try:
             self.dtrs_client.lookup(self.caller, 'this-dt-doesnt-exist', node)
         except DeployableTypeLookupError, e:
-            log.info('Got expected error: ' + str(e))
+            log.info("Got expected error: " + str(e))
         else:
             self.fail("Expected lookup error")
 
@@ -82,7 +84,7 @@ class DTRSTests(unittest.TestCase):
         try:
             self.dtrs_client.lookup(self.caller, 'base-cluster-1', req_node)
         except DeployableTypeLookupError, e:
-            log.info('Got expected error: ' + str(e))
+            log.info("Got expected error: " + str(e))
         else:
             self.fail("Expected lookup error")
 
@@ -102,7 +104,7 @@ class DTRSTests(unittest.TestCase):
         try:
             self.dtrs_client.lookup(self.caller, 'with-vars', req_node)
         except DeployableTypeValidationError, e:
-            log.info('Got expected error: ' + str(e))
+            log.info("Got expected error: " + str(e))
         else:
             self.fail("Expected validation error")
 
@@ -121,17 +123,60 @@ class DTRSTests(unittest.TestCase):
                 }
             },
             'contextualization': {
+                'method': 'chef',
+                'run_list': ['hats', 'jackets'],
+                'attributes': {"a": 4}
+            }
+        }
+        self.dtrs.add_dt(self.caller, "with-chef", dt_definition)
+
+        chef_credential = {
+            'url': "http://fake",
+            'client_key': 'aewlkfaejfalfk',
+            'validator_key': 'aejfalkefjaklef'
+        }
+        self.dtrs.add_credentials(self.caller, "hats", chef_credential,
+            credential_type="chef")
+        self.dtrs.add_credentials(self.caller, "chef", chef_credential,
+            credential_type="chef")
+
+        req_node = {'site': 'nimbus-test'}
+
+        lookup_vars = {'chef_credential': 'hats'}
+
+        response = self.dtrs_client.lookup(self.caller, 'with-chef', req_node, vars=lookup_vars)
+        self.assertEqual(response['node']['ctx_method'], 'chef')
+        self.assertIs(response['node']['needs_nimbus_ctx'], False)
+        self.assertEqual(response['node']['chef_runlist'], ['hats', 'jackets'])
+        self.assertEqual(response['node']['chef_attributes'], {"a": 4})
+        self.assertEqual(response['node']['chef_credential'], "hats")
+
+        # lookup without chef_credential in vars results in default of "chef"
+        response = self.dtrs_client.lookup(self.caller, 'with-chef', req_node)
+        self.assertEqual(response['node']['chef_credential'], "chef")
+
+    def test_chef_solo_contextualization(self):
+        dt_definition = {
+            'mappings': {
+                'nimbus-test': {
+                    'iaas_image': 'fake-image',
+                    'iaas_allocation': 'm1.small'
+                }
+            },
+            'contextualization': {
                 'method': 'chef-solo',
                 'chef_config': {
                     "run_list": ["recipe[r2app]", "recipe[user]"]
                 }
             }
         }
-        self.dtrs.add_dt(self.caller, "with-chef", dt_definition)
+        self.dtrs.add_dt(self.caller, "with-chef-solo", dt_definition)
 
         req_node = {'site': 'nimbus-test'}
 
-        response = self.dtrs_client.lookup(self.caller, 'with-chef', req_node)
+        response = self.dtrs_client.lookup(self.caller, 'with-chef-solo', req_node)
+        self.assertEqual(response['node']['ctx_method'], 'chef-solo')
+        self.assertIs(response['node']['needs_nimbus_ctx'], True)
         self.assertTrue(response['document'].find('dt-chef-solo') != -1)
         self.assertFalse('iaas_userdata' in response['node'])
 
@@ -155,6 +200,8 @@ class DTRSTests(unittest.TestCase):
         req_node = {'site': 'nimbus-test'}
 
         response = self.dtrs_client.lookup(self.caller, 'with-userdata', req_node)
+        self.assertEqual(response['node']['ctx_method'], 'userdata')
+        self.assertIs(response['node']['needs_nimbus_ctx'], False)
         self.assertFalse(response['document'].find('dt-chef-solo') != -1)
         self.assertTrue('iaas_userdata' in response['node'])
         self.assertEqual(userdata, response['node']['iaas_userdata'])

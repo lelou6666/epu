@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 
 import os
 import socket
@@ -12,17 +14,6 @@ import logging
 from kazoo.client import KazooClient
 
 log = logging.getLogger(__name__)
-
-
-class Mock(object):
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-    def __repr__(self):
-        return self.__str__()
-
-    def __str__(self):
-        return "Mock(" + ",".join("%s=%s" % (k, v) for k, v in self.__dict__.iteritems()) + ")"
 
 
 class MockLeader(object):
@@ -204,6 +195,7 @@ class ZooKeeperTestMixin(object):
             try:
                 self.kazoo.delete("/", recursive=True)
                 self.kazoo.stop()
+                self.kazoo.close()
             except Exception:
                 log.exception("Problem tearing down ZooKeeper")
         if self.proxy:

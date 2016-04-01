@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import threading
 import heapq
@@ -90,7 +92,8 @@ class PDDoctor(object):
                 self.condition.wait()
 
         log.debug("Waiting on monitor thread to exit")
-        self.monitor_thread.join()
+        if self.monitor_thread is not None:
+            self.monitor_thread.join()
         self.monitor = None
         self.monitor_thread = None
 

@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import logging
 
 from epu.states import InstanceState, ProcessState, ExecutionResourceState
@@ -7,7 +9,9 @@ from epu.util import is_valid_identifier, parse_datetime, ceiling_datetime
 from epu.processdispatcher.store import ProcessRecord, NodeRecord, \
     ResourceRecord, ProcessDefinitionRecord
 from epu.processdispatcher.modes import RestartMode
-from epu.processdispatcher.util import get_process_state_message
+from epu.processdispatcher.util import get_process_state_message, \
+    get_set_difference_debug_message
+from epu.processdispatcher.engines import EngineSpec
 
 log = logging.getLogger(__name__)
 
@@ -638,14 +642,19 @@ class ProcessDispatcherCore(object):
 
                 continue
 
-            if process.state == ProcessState.PENDING and \
-               state == ProcessState.RUNNING:
+            if process.state in (ProcessState.ASSIGNED, ProcessState.PENDING) and \
+               state in (ProcessState.PENDING, ProcessState.RUNNING):
 
                 assigned_procs.add(process.key)
 
-                # mark as running and notify subscriber
                 process, changed = self.process_change_state(
-                    process, ProcessState.RUNNING)
+                    process, state)
+
+                try:
+                    self.store.remove_queued_process(process.owner,
+                        process.upid, process.round)
+                except NotFoundError:
+                    pass
 
             elif state in (ProcessState.TERMINATED, ProcessState.FAILED,
                            ProcessState.EXITED):
@@ -662,7 +671,7 @@ class ProcessDispatcherCore(object):
                         process, ProcessState.TERMINATED, assigned=None)
 
                 # otherwise it may need to be rescheduled
-                elif process.state in (ProcessState.PENDING,
+                elif process.state in (ProcessState.ASSIGNED, ProcessState.PENDING,
                                     ProcessState.RUNNING):
 
                     if self.process_should_restart(process, state):
@@ -965,7 +974,10 @@ class ProcessDispatcherCore(object):
         """
         constraints = {}
         engine_id = self.ee_registry.get_process_definition_engine_id(process.definition)
-        if engine_id is None and process.constraints.get('engine') is None:
+        if process.constraints.get('engine') is not None:
+            engine_id = process.constraints.get('engine')
+
+        if engine_id is None:
             engine_id = self.ee_registry.default
 
         if engine_id is not None:
@@ -1002,24 +1014,21 @@ class ProcessDispatcherCore(object):
 
         return state
 
+    def add_engine(self, definition):
+        try:
+            engine_id = definition['engine_id']
+            del(definition['engine_id'])
+        except KeyError:
+            raise BadRequestError("Definition must have an 'engine_id'")
 
-def get_set_difference_debug_message(set1, set2):
-    """Utility function for building log messages about set content changes
-    """
-    try:
-        difference1 = list(set1.difference(set2))
-        difference2 = list(set2.difference(set1))
-    except Exception, e:
-        return "can't calculate set difference. are these really sets?: %s" % str(e)
+        try:
+            slots = definition['slots']
+            del(definition['slots'])
+        except KeyError:
+            raise BadRequestError("Definition must have 'slots'")
 
-    if difference1 and difference2:
-        return "removed=%s added=%s" % (difference1, difference2)
-    elif difference1:
-        return "removed=%s" % (difference1,)
-    elif difference2:
-        return "added=%s" % (difference2,)
-    else:
-        return "sets are equal"
+        engine = EngineSpec(engine_id, slots, **definition)
+        self.ee_registry.add(engine)
 
 
 def _check_process_schedule_idempotency(process, parameters):

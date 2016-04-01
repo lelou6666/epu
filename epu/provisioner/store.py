@@ -1,4 +1,5 @@
-#!/usr/bin/env python
+# Copyright 2013 University of Chicago
+
 
 """
 @file epu/provisioner/store.py
@@ -410,6 +411,10 @@ class ProvisionerZooKeeperStore(object):
         if self._election_thread:
             self._election_thread.join()
         self.kazoo.stop()
+        try:
+            self.kazoo.close()
+        except Exception:
+            log.exception("Problem cleaning up kazoo")
 
     def _connection_state_listener(self, state):
         # called by kazoo when the connection state changes.

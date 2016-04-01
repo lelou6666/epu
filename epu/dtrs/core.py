@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import string
 
@@ -60,7 +62,6 @@ class DTRSCore(object):
         return sanitize_record(ret)
 
     def lookup(self, caller, dt_name, dtrs_request_node, vars):
-        # TODO Implement contextualization with deep merging of variables
 
         log.debug("lookup dt %s for user %s" % (dt_name, caller))
         dt = self.store.describe_dt(caller, dt_name)
@@ -105,36 +106,85 @@ class DTRSCore(object):
         except KeyError:
             raise DeployableTypeLookupError('key_name missing from credentials of caller %s and site %s', caller, site)
 
+<<<<<<< HEAD
         userdata = None
         chef_runlist = None
         chef_attributes = None
         use_chef = False
+=======
+        response_node = {
+            'iaas_image': iaas_image,
+            'iaas_allocation': iaas_allocation,
+            'iaas_sshkeyname': iaas_sshkeyname,
+            'needs_elastic_ip': bool(site_mapping.get('needs_elastic_ip', False)),
+        }
 
+        ctx_method = 'chef-solo'
+>>>>>>> refs/remotes/nimbusproject/master
+
+        # this value controls whether the Provisioner will attempt to create a Nimbus context
+        # for the VM.
+        needs_nimbus_ctx = True
         contextualization = dt.get('contextualization')
-        if contextualization:
-            ctx_method = contextualization.get('method')
+        if contextualization and contextualization.get('method'):
+            ctx_method = contextualization['method']
             if ctx_method == 'chef-solo':
                 try:
                     chef_json = contextualization['chef_config']
                 except KeyError:
                     raise DeployableTypeValidationError(dt_name, 'Missing chef_config in DT definition')
                 document = generate_cluster_document(iaas_image, chef_json=chef_json)
+<<<<<<< HEAD
             elif ctx_method == 'chef':
                 use_chef = True
                 chef_runlist = contextualization.get('run_list', [])
                 chef_attributes = contextualization.get('attributes', {})
                 document = generate_cluster_document(iaas_image)
 
+=======
+
+            elif ctx_method == 'chef':
+                needs_nimbus_ctx = False
+                response_node['chef_runlist'] = contextualization.get('run_list', [])
+                response_node['chef_attributes'] = contextualization.get('attributes', {})
+                document = generate_cluster_document(iaas_image)
+
+                # A chef credential name should be present in the vars, otherwise assume default "chef"
+                if vars:
+                    chef_credential_name = vars.get('chef_credential', 'chef')
+                else:
+                    chef_credential_name = 'chef'
+                chef_credentials = self.store.describe_credentials(caller,
+                    CredentialType.CHEF, chef_credential_name)
+                if chef_credentials is None:
+                    raise DeployableTypeLookupError('Chef credentials %s missing for caller %s' %
+                        (chef_credential_name, caller))
+                response_node['chef_credential'] = chef_credential_name
+
+>>>>>>> refs/remotes/nimbusproject/master
             elif ctx_method == 'userdata':
+                needs_nimbus_ctx = False
                 try:
-                    userdata = str(contextualization['userdata'])
+                    userdata = contextualization['userdata']
                 except KeyError:
                     raise DeployableTypeValidationError(dt_name, 'Missing userdata in DT definition')
+                if isinstance(userdata, dict):
+                    try:
+                        userdata = str(userdata[site])
+                    except KeyError:
+                        raise DeployableTypeValidationError(dt_name, 'Missing site %s for multi-site userdata in DT definition' % site)
+                else:
+                    userdata = str(userdata)
+
                 document = generate_cluster_document(iaas_image)
+                response_node['iaas_userdata'] = userdata
             else:
                 raise DeployableTypeValidationError(dt_name, 'Unknown contextualization method %s' % ctx_method)
         else:
             document = generate_cluster_document(iaas_image)
+
+        response_node['ctx_method'] = ctx_method
+        response_node['needs_nimbus_ctx'] = needs_nimbus_ctx
 
         all_vars = {}
         if vars:
@@ -149,6 +199,7 @@ class DTRSCore(object):
         except ValueError, e:
             raise DeployableTypeValidationError(dt_name, 'Deployable type document has bad variable: %s' % str(e))
 
+<<<<<<< HEAD
         response_node = {
             'iaas_image': iaas_image,
             'iaas_allocation': iaas_allocation,
@@ -164,6 +215,8 @@ class DTRSCore(object):
             response_node['chef_attributes'] = chef_attributes
             response_node['chef_runlist'] = chef_runlist
 
+=======
+>>>>>>> refs/remotes/nimbusproject/master
         result = {'document': document, 'node': response_node}
         return result
 

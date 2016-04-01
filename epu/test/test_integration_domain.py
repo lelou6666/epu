@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import os
 import uuid
 import unittest
@@ -64,8 +66,8 @@ def _make_dt(site_name):
         'mappings': {
         },
         'contextualization': {
-        'method': 'chef-solo',
-        'chef_config': {}
+            'method': 'chef-solo',
+            'chef_config': {}
         }
     }
 
@@ -96,7 +98,7 @@ def tearDownModule():
 
 example_definition = {
     'general': {
-        'engine_class': 'epu.decisionengine.impls.phantom.PhantomSingleSiteEngine',
+        'engine_class': 'epu.decisionengine.impls.simplest.SimplestEngine',
     },
     'health': {
         'monitor_health': False
@@ -117,7 +119,7 @@ def _make_domain_def(n, epuworker_type, site_name):
 
     example_domain = {
         'engine_conf': {
-            'domain_desired_size': n,
+            'preserve_n': n,
             'epuworker_type': epuworker_type,
             'force_site': site_name
         }
@@ -231,7 +233,7 @@ class TestIntegrationDomain(unittest.TestCase, TestFixture):
         # wait for intersection between sets to be empty (no domains left)
         try:
             wait(lambda: len(domains & set(self.epum_client.list_domains())) == 0,
-                timeout=60, wait=delay)
+                timeout=240, wait=delay)
         except wait.TimeOutWaitingFor:
             remaining = domains & set(self.epum_client.list_domains())
             self.fail("Timed out waiting for domains to exit. domains: %s" % list(remaining))

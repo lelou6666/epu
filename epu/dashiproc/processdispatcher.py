@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import threading
 
@@ -72,11 +74,12 @@ class ProcessDispatcherService(object):
 
         launch_type = self.CFG.processdispatcher.get('launch_type', 'supd')
         restart_throttling_config = self.CFG.processdispatcher.get('restart_throttling_config', {})
+        dispatch_retry_seconds = self.CFG.processdispatcher.get('dispatch_retry_seconds')
 
         self.matchmaker = PDMatchmaker(self.core, self.store, self.eeagent_client,
             self.registry, self.epum_client, self.notifier, self.topic,
             domain_definition_id, base_domain_config, launch_type,
-            restart_throttling_config)
+            restart_throttling_config, dispatch_retry_seconds)
 
         self.doctor = PDDoctor(self.core, self.store, config=self.CFG)
         self.ready_event = threading.Event()
@@ -110,6 +113,7 @@ class ProcessDispatcherService(object):
         self.dashi.handle(self.node_state)
         self.dashi.handle(self.heartbeat, sender_kwarg='sender')
         self.dashi.handle(self.dump)
+        self.dashi.handle(self.add_engine)
 
         self.matchmaker.start_election()
 
@@ -195,6 +199,9 @@ class ProcessDispatcherService(object):
 
     def dump(self):
         return self.core.dump()
+
+    def add_engine(self, definition):
+        self.core.add_engine(definition)
 
 
 class SubscriberNotifier(object):

@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import simplejson as json
 
@@ -347,6 +349,10 @@ class DTRSZooKeeperStore(object):
 
     def shutdown(self):
         self.kazoo.stop()
+        try:
+            self.kazoo.close()
+        except Exception:
+            log.exception("Problem cleaning up kazoo")
 
     #########################################################################
     # SITES

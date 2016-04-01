@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import time
 import simplejson as json
@@ -343,6 +345,7 @@ class DomainStore(object):
                 return True
             # instance was probably a duplicate
             return False
+        return False
 
     def mark_instance_terminating(self, instance_id):
         """Mark an instance for termination
@@ -502,6 +505,9 @@ class LocalEPUMStore(EPUMStore):
         self.local_reaper_ref = None
 
     def initialize(self):
+        pass
+
+    def shutdown(self):
         pass
 
     def _change_decider(self, make_leader):
@@ -1007,6 +1013,13 @@ class ZooKeeperEPUMStore(EPUMStore):
 
         for path in (self.DOMAINS_PATH, self.DEFINITIONS_PATH):
             self.kazoo.ensure_path(path)
+
+    def shutdown(self):
+        self.kazoo.stop()
+        try:
+            self.kazoo.close()
+        except Exception:
+            log.exception("Problem cleaning up kazoo")
 
     def _connection_state_listener(self, state):
         # called by kazoo when the connection state changes.

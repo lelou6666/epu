@@ -1,6 +1,8 @@
+# Copyright 2013 University of Chicago
+
 import logging
 
-from dashi import bootstrap, DashiError
+from dashi import bootstrap
 import dashi.exceptions
 
 from epu.epumanagement.test.mocks import MockOUAgentClient, MockProvisionerClient
