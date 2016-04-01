@@ -41,11 +41,18 @@ class FakeDTRS(object):
 
         raise Exception("bad fixture: nothing to return")
 
-    def describe_site(self, site_name):
-        if site_name in self.sites:
-            return self.sites[site_name]
+    def describe_site(self, site_name, caller=None):
+        # Check first if a user-specific site exists
+        if caller is not None:
+            caller_sites = self.sites.get(caller, [])
+            if site_name in caller_sites:
+                return caller_sites[site_name]
 
-        raise Exception("bad fixture: nothing to return for site %s" % site_name)
+        # Then try the public sites (under the None key)
+        if site_name in self.sites[None]:
+            return self.sites[None][site_name]
+
+        raise Exception("bad fixture: nothing to return for caller %s and site %s" % (caller, site_name))
 
     def describe_credentials(self, caller, site_name, credential_type="site"):
         credentials = self.credentials[credential_type]

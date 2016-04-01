@@ -398,7 +398,7 @@ class ProvisionerCore(object):
             raise ProvisioningError("Called with bad caller %s" % caller)
 
         # Get the site description from DTRS
-        site_description = self.dtrs.describe_site(site_name)
+        site_description = self.dtrs.describe_site(site_name, caller=caller)
         if not site_description:
             raise ProvisioningError("Site description not found for %s" % site_name)
 
@@ -543,11 +543,13 @@ class ProvisionerCore(object):
                 n.ctx_name = spec.name
                 if elastic_ip is not None:
                     n.elastic_ip = elastic_ip
+                    n.public_ip = elastic_ip
         else:
 
             node.ctx_name = spec.name
             if elastic_ip is not None:
                 node.elastic_ip = elastic_ip
+                node.public_ip = elastic_ip
 
         return node
 
@@ -674,7 +676,7 @@ class ProvisionerCore(object):
             raise ProvisioningError("Called with bad caller %s" % caller)
 
         # Get the site description from DTRS
-        site_description = self.dtrs.describe_site(site)
+        site_description = self.dtrs.describe_site(site, caller=caller)
         if not site_description:
             raise ProvisioningError("Site description not found for %s" % site)
 
@@ -1138,7 +1140,7 @@ class ProvisionerCore(object):
                 raise ProvisioningError(msg)
 
             # Get the site description from DTRS
-            site_description = self.dtrs.describe_site(site_name)
+            site_description = self.dtrs.describe_site(site_name, caller=caller)
             if not site_description:
                 msg = "Site description not found for %s" % site_name
                 log.error(msg)
@@ -1291,10 +1293,11 @@ def update_node_ip_info(node_rec, iaas_node):
     updated = False
 
     public_ip = node_rec.get('public_ip')
+    elastic_ip = node_rec.get('elastic_ip')
     iaas_public_ip = iaas_node.public_ip
     if isinstance(iaas_public_ip, (list, tuple)):
         iaas_public_ip = iaas_public_ip[0] if iaas_public_ip else None
-    if not public_ip or (iaas_public_ip and public_ip != iaas_public_ip):
+    if not elastic_ip and (not public_ip or (iaas_public_ip and public_ip != iaas_public_ip)):
         node_rec['public_ip'] = iaas_public_ip
         updated = True
 
@@ -1315,8 +1318,10 @@ def update_node_ip_info(node_rec, iaas_node):
         updated = True
 
     try:
-        node_rec['elastic_ip'] = iaas_node.elastic_ip
-        updated = True
+        if iaas_node.elastic_ip is not None:
+            node_rec['elastic_ip'] = iaas_node.elastic_ip
+            node_rec['public_ip'] = iaas_node.elastic_ip
+            updated = True
     except AttributeError:
         pass
 

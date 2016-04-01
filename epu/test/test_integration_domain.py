@@ -98,7 +98,7 @@ def tearDownModule():
 
 example_definition = {
     'general': {
-        'engine_class': 'epu.decisionengine.impls.phantom.PhantomSingleSiteEngine',
+        'engine_class': 'epu.decisionengine.impls.simplest.SimplestEngine',
     },
     'health': {
         'monitor_health': False
@@ -119,7 +119,7 @@ def _make_domain_def(n, epuworker_type, site_name):
 
     example_domain = {
         'engine_conf': {
-            'domain_desired_size': n,
+            'preserve_n': n,
             'epuworker_type': epuworker_type,
             'force_site': site_name
         }

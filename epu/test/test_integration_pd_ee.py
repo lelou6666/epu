@@ -165,3 +165,4 @@ class TestIntegrationPDEEAgent(unittest.TestCase, TestFixture):
                 continue
             elif procs[0]['state'] == '800-EXITED':
                 break
+
