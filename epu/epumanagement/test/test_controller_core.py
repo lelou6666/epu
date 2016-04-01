@@ -1,18 +1,30 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import itertools
 import uuid
 import unittest
+import threading
+
+from mock import Mock
 
 from epu.decisionengine.impls.simplest import CONF_PRESERVE_N
+<<<<<<< HEAD
 from epu.epumanagement.conf import *
 from epu.epumanagement.store import LocalDomainStore
+=======
+from epu.epumanagement.conf import *  # noqa
+from epu.epumanagement.store import LocalDomainStore, ZooKeeperDomainStore
+>>>>>>> refs/remotes/nimbusproject/master
 from epu.states import InstanceState, InstanceHealthState
 from epu.epumanagement.decider import ControllerCoreControl
 from epu.epumanagement.core import EngineState
 from epu.epumanagement.test.mocks import MockProvisionerClient
-from epu.test import Mock
+from epu.test import ZooKeeperTestMixin
+from epu.exceptions import WriteConflictError
 
 log = logging.getLogger(__name__)
+
 
 class BaseControllerStateTests(unittest.TestCase):
     """Base test class with utility functions.
@@ -24,11 +36,19 @@ class BaseControllerStateTests(unittest.TestCase):
 
     def assertInstance(self, instance_id, **kwargs):
         instance = self.domain.get_instance(instance_id)
+<<<<<<< HEAD
         for key,value in kwargs.iteritems():
             self.assertEqual(getattr(instance, key), value)
 
         instance = self.domain.get_instance(instance_id)
         for key,value in kwargs.iteritems():
+=======
+        for key, value in kwargs.iteritems():
+            self.assertEqual(getattr(instance, key), value)
+
+        instance = self.domain.get_instance(instance_id)
+        for key, value in kwargs.iteritems():
+>>>>>>> refs/remotes/nimbusproject/master
             self.assertEqual(getattr(instance, key), value)
 
     def new_instance(self, time, extravars=None):
@@ -94,6 +114,58 @@ class ControllerStateStoreTests(BaseControllerStateTests):
         self.assertEqual(len(all_instances), 1)
         self.assertIn(instance_id, all_instances)
 
+<<<<<<< HEAD
+=======
+    def test_instance_update_conflict(self):
+        launch_id = str(uuid.uuid4())
+        instance_id = str(uuid.uuid4())
+        self.domain.new_instance_launch("dtid", instance_id, launch_id,
+                                             "chicago", "big", timestamp=1)
+
+        sneaky_msg = dict(node_id=instance_id, launch_id=launch_id,
+                   site="chicago", allocation="big",
+                   state=InstanceState.PENDING)
+
+        # patch in a function that sneaks in an instance record update just
+        # before a requested update. This simulates the case where two EPUM
+        # workers are competing to update the same instance.
+        original_update_instance = self.domain.update_instance
+
+        patch_called = threading.Event()
+
+        def patched_update_instance(*args, **kwargs):
+            patch_called.set()
+            # unpatch ourself first so we don't recurse forever
+            self.domain.update_instance = original_update_instance
+
+            self.domain.new_instance_state(sneaky_msg, timestamp=2)
+            original_update_instance(*args, **kwargs)
+        self.domain.update_instance = patched_update_instance
+
+        # send our "real" update. should get a conflict
+        msg = dict(node_id=instance_id, launch_id=launch_id,
+                   site="chicago", allocation="big",
+                   state=InstanceState.STARTED)
+
+        with self.assertRaises(WriteConflictError):
+            self.domain.new_instance_state(msg, timestamp=2)
+
+        assert patch_called.is_set()
+
+
+class ZooKeeperControllerStateStoreTests(ControllerStateStoreTests, ZooKeeperTestMixin):
+
+    # this runs all of the ControllerStateStoreTests tests plus any
+    # ZK-specific ones
+
+    def setUp(self):
+        self.setup_zookeeper("/epum_store_tests_")
+        self.addCleanup(self.teardown_zookeeper)
+        self.domain = ZooKeeperDomainStore("david", "domain1", self.kazoo,
+            self.kazoo.retry, self.zk_base_path)
+
+
+>>>>>>> refs/remotes/nimbusproject/master
 class ControllerCoreStateTests(BaseControllerStateTests):
     """ControllerCoreState tests that only use in memory store
 
@@ -107,7 +179,7 @@ class ControllerCoreStateTests(BaseControllerStateTests):
 
         (when they don't arrive in state updates)
         """
-        extravars = {'iwant': 'asandwich', 4: 'real'}
+        extravars = {'iwant': 'asandwich', '4': 'real'}
         launch_id, instance_id = self.new_instance(1,
                                                          extravars=extravars)
         self.new_instance_state(launch_id, instance_id,
@@ -123,7 +195,11 @@ class ControllerCoreStateTests(BaseControllerStateTests):
 
         # now fake a response like we'd get from provisioner dump_state
         # when it has no knowledge of instance
+<<<<<<< HEAD
         record = {"node_id":instance_id, "state":InstanceState.FAILED}
+=======
+        record = {"node_id": instance_id, "state": InstanceState.FAILED}
+>>>>>>> refs/remotes/nimbusproject/master
         self.domain.new_instance_state(record, timestamp=2)
 
         instance = self.domain.get_instance(instance_id)
@@ -137,7 +213,11 @@ class ControllerCoreStateTests(BaseControllerStateTests):
         self.new_instance_state(launch_id1, instance_id1, InstanceState.RUNNING, 2)
         es = self.domain.get_engine_state()
 
+<<<<<<< HEAD
         #check instances
+=======
+        # check instances
+>>>>>>> refs/remotes/nimbusproject/master
 
         # TODO instance change tracking not supported
 #        self.assertEqual(len(es.instance_changes), 2)
@@ -201,6 +281,21 @@ class ControllerCoreStateTests(BaseControllerStateTests):
 
         self.assertEqual(self.domain.get_instance(instance_id).state,
             InstanceState.STARTED)
+<<<<<<< HEAD
+=======
+
+
+class ZooKeeperControllerCoreStateStoreTests(ControllerCoreStateTests, ZooKeeperTestMixin):
+
+    # this runs all of the ControllerCoreStateTests tests plus any
+    # ZK-specific ones
+
+    def setUp(self):
+        self.setup_zookeeper("/epum_store_tests_")
+        self.addCleanup(self.teardown_zookeeper)
+        self.domain = ZooKeeperDomainStore("david", "domain1", self.kazoo,
+            self.kazoo.retry, self.zk_base_path)
+>>>>>>> refs/remotes/nimbusproject/master
 
 
 class EngineStateTests(unittest.TestCase):
@@ -227,7 +322,7 @@ class EngineStateTests(unittest.TestCase):
         self.assertEqual(es.get_instance("i1").state, InstanceState.RUNNING)
         self.assertEqual(es.get_instance("i2").state, InstanceState.FAILED)
         self.assertEqual(es.get_instance("i3").state, InstanceState.PENDING)
-        self.assertEqual(es.get_instance("i4"), None) # there is no i4
+        self.assertEqual(es.get_instance("i4"), None)  # there is no i4
         self.assertEqual(len(es.get_instance_changes("i1")), 4)
         self.assertEqual(len(es.get_instance_changes("i2")), 3)
         self.assertEqual(len(es.get_instance_changes("i3")), 2)
@@ -304,6 +399,7 @@ class EngineStateTests(unittest.TestCase):
         self.assertTrue(i2 in unhealthy)
         self.assertTrue(i3 in unhealthy)
 
+
 class ControllerCoreControlTests(unittest.TestCase):
 
     def _config_simplest_domain_conf(self, n_preserving):
@@ -312,14 +408,18 @@ class ControllerCoreControlTests(unittest.TestCase):
         engine_class = "epu.decisionengine.impls.simplest.SimplestEngine"
         general = {EPUM_CONF_ENGINE_CLASS: engine_class}
         health = {EPUM_CONF_HEALTH_MONITOR: False}
-        engine = {CONF_PRESERVE_N:n_preserving}
-        return {EPUM_CONF_GENERAL:general, EPUM_CONF_ENGINE: engine, EPUM_CONF_HEALTH: health}
+        engine = {CONF_PRESERVE_N: n_preserving}
+        return {EPUM_CONF_GENERAL: general, EPUM_CONF_ENGINE: engine, EPUM_CONF_HEALTH: health}
 
     def setUp(self):
         self.provisioner = MockProvisionerClient()
         config = self._config_simplest_domain_conf(1)
         self.state = LocalDomainStore('david', "epu1", config)
+<<<<<<< HEAD
         self.prov_vars = {"foo" : "bar"}
+=======
+        self.prov_vars = {"foo": "bar"}
+>>>>>>> refs/remotes/nimbusproject/master
         self.controller_name = "fakey"
         self.control = ControllerCoreControl(self.provisioner, self.state,
                                              self.prov_vars,
@@ -327,19 +427,15 @@ class ControllerCoreControlTests(unittest.TestCase):
 
     def test_configure_1(self):
         self.control.configure(None)
-        self.assertEqual(self.control.sleep_seconds, 5.0)
         self.assertEqual(self.control.prov_vars, self.prov_vars)
 
     def test_configure_2(self):
         self.control.configure({})
-        self.assertEqual(self.control.sleep_seconds, 5.0)
         self.assertEqual(self.control.prov_vars, self.prov_vars)
 
     def test_configure_3(self):
-        params = {"timed-pulse-irregular" : 3000,
-                  PROVISIONER_VARS_KEY : {"blah": "blah"}}
+        params = {PROVISIONER_VARS_KEY: {"blah": "blah"}}
         self.control.configure(params)
-        self.assertEqual(self.control.sleep_seconds, 3.0)
         self.assertEqual(self.control.prov_vars, {"blah": "blah"})
 
     def test_launch(self):
@@ -348,13 +444,14 @@ class ControllerCoreControlTests(unittest.TestCase):
 
         self.assertEqual(len(instance_ids), 1)
 
-        #check that right info got added to state
+        # check that right info got added to state
         instance_id = instance_ids[0]
         instance = self.state.get_instance(instance_id)
         self.assertEqual(instance.instance_id, instance_id)
         self.assertEqual(instance.launch_id, launch_id)
         self.assertEqual(instance.site, "chicago")
         self.assertEqual(instance.allocation, "small")
+        self.assertEqual(instance.extravars, {"v1": 1})
 
         # and provisionerclient called
         self.assertEqual(len(self.provisioner.launches), 1)
@@ -364,7 +461,24 @@ class ControllerCoreControlTests(unittest.TestCase):
         # vars are merged result
         self.assertEqual(launch['vars']['foo'], "bar")
         self.assertEqual(launch['vars']['v1'], 1)
-        self.assertEqual(launch['subscribers'], (self.controller_name,))
         self.assertEqual(launch['site'], "chicago")
         self.assertEqual(launch['allocation'], "small")
 
+
+class CoreInstanceTests(unittest.TestCase):
+    def test_instance_version(self):
+        instance = CoreInstance(instance_id="i1", launch_id="l1",
+            allocation="a1", site="s1", state=InstanceState.RUNNING)
+
+        self.assertEqual(instance._version, None)
+
+        self.assertNotIn("_version", instance)
+        self.assertNotIn("version", instance.keys())
+
+        instance.set_version(1)
+        self.assertEqual(instance._version, 1)
+
+        self.assertNotIn("_version", instance)
+        self.assertNotIn("version", instance.keys())
+        d = dict(instance.iteritems())
+        self.assertNotIn("_version", d)

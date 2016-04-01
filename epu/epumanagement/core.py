@@ -1,18 +1,30 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import itertools
 import time
 
-from epu.epumanagement.forengine import Instance, SensorItem, State
+from epu.epumanagement.forengine import Instance, State
 
 from epu.states import InstanceState, InstanceHealthState
 
 log = logging.getLogger(__name__)
 
 REQUIRED_INSTANCE_FIELDS = ('instance_id', 'launch_id', 'site', 'allocation', 'state')
+
+
 class CoreInstance(Instance):
+    _d = None
+
+    # version information used for ZooKeeper storage backend
+    _version = None
+
+    def set_version(self, version):
+        object.__setattr__(self, "_version", version)
+
     @classmethod
     def from_existing(cls, previous, **kwargs):
-        dct = previous.__dict__.copy()
+        dct = previous._d.copy()
         dct.update(kwargs)
         return cls(**kwargs)
 
@@ -24,59 +36,61 @@ class CoreInstance(Instance):
         for f in REQUIRED_INSTANCE_FIELDS:
             if not f in kwargs:
                 raise TypeError("Missing required instance field: " + f)
-        self.__dict__.update(kwargs)
+        object.__setattr__(self, "_d", dict(kwargs.iteritems()))
 
     def __getattr__(self, item):
         # only called when regular attribute resolution fails
-        return None
+        return self._d.get(item)
 
     def __setattr__(self, key, value):
         # obviously not foolproof, more of a warning
         raise KeyError("Instance attribute setting disabled")
 
     def __getitem__(self, item):
-        return self.__dict__[item]
+        return self._d[item]
 
     def __iter__(self):
-        return iter(self.__dict__)
+        return iter(self._d)
 
     def get(self, key, default=None):
         """Get a single instance property
         """
-        return self.__dict__.get(key, default)
+        return self._d.get(key, default)
 
     def iteritems(self):
         """Iterator for (key,value) pairs of instance properties
         """
-        return self.__dict__.iteritems()
+        return self._d.iteritems()
 
     def iterkeys(self):
         """Iterator for instance property keys
         """
-        return  self.__dict__.iterkeys()
+        return self._d.iterkeys()
 
     def items(self):
         """List of (key,value) pairs of instance properties
         """
-        return self.__dict__.items()
+        return self._d.items()
 
     def keys(self):
         """List of available instance property keys
         """
-        return self.__dict__.keys()
+        return self._d.keys()
 
     def to_dict(self):
         return dict(self.iteritems())
 
 # OUT_OF_CONTACT is healthy because it is not marked truly missing yet
 _HEALTHY_STATES = (InstanceHealthState.OK, InstanceHealthState.UNKNOWN, InstanceHealthState.OUT_OF_CONTACT)
+
+
 class EngineState(State):
     """State object given to decision engine
     """
 
     def __init__(self):
         State.__init__(self)
-        
+
         # the last value of each sensor input.
         # for example `queue_size = state.sensors['queuestat']`
         self.sensors = None
@@ -184,44 +198,17 @@ class EngineState(State):
         for instance in self.instances.itervalues():
             if instance.state == InstanceState.RUNNING_FAILED:
                 unhealthy.append(instance)
-                continue # health report from epuagent (or absence of it) is irrelevant
+                continue  # health report from epuagent (or absence of it) is irrelevant
 
             if instance.health not in _HEALTHY_STATES:
 
                 # only allow the zombie state for instances that are
                 # terminated
                 if (instance.state < InstanceState.TERMINATED or
-                    instance.health == InstanceHealthState.ZOMBIE):
+                        instance.health == InstanceHealthState.ZOMBIE):
                     unhealthy.append(instance)
 
         return unhealthy
-
-
-class SensorItemParser(object):
-    """Loads an incoming sensor item message
-    """
-    def parse(self, content):
-        if not content:
-            log.warn("Received empty sensor item: %s", content)
-            return None
-
-        if not isinstance(content, dict):
-            log.warn("Received non-dict sensor item: %s", content)
-            return None
-
-        try:
-            item = SensorItem(content['sensor_id'],
-                              long(content['time']),
-                              content['value'])
-        except KeyError,e:
-            log.warn('Received invalid sensor item. Missing "%s": %s', e,
-                     content)
-            return None
-        except ValueError,e:
-            log.warn('Received invalid sensor item. Bad "%s": %s', e, content)
-            return None
-
-        return item
 
 
 class InstanceParser(object):
@@ -249,7 +236,7 @@ class InstanceParser(object):
             return None
 
         if not previous:
-            log.warn("Instance %s: got state update but instance is unknown."+
+            log.warn("Instance %s: got state update but instance is unknown." +
             " It will be dropped: %s", instance_id, content)
             return None
 
@@ -284,12 +271,20 @@ class InstanceParser(object):
         d['error_time'] = previous.error_time if previous.error_time else None
         new = CoreInstance(**d)
 
-        if new.state <= previous.state:
-            log.warn("Instance %s: got out of order or duplicate state message!"+
+        previous_update_counter = previous.get('update_counter')
+        new_update_counter = new.get('update_counter')
+        if new.state < previous.state or (new.state == previous.state and
+                previous_update_counter and new_update_counter <=
+                previous_update_counter):
+            log.warn("Instance %s: got out of order or duplicate state message!" +
             " It will be dropped: %s", instance_id, content)
             return None
         return new
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> refs/remotes/nimbusproject/master
 class DomainSubscribers(object):
 
     def __init__(self, notifier):
@@ -306,6 +301,13 @@ class DomainSubscribers(object):
 
         tups = domain.get_subscribers()
         for subscriber_name, subscriber_op in tups:
+<<<<<<< HEAD
             content = {'node_id': instance.instance_id, 'state': state,
                        'deployable_type' : instance.deployable_type}
+=======
+            properties = {'hostname': instance.public_ip}
+            content = {'node_id': instance.instance_id, 'state': state,
+                       'domain_id': domain.domain_id,
+                       'properties': properties}
+>>>>>>> refs/remotes/nimbusproject/master
             self.notifier.notify_by_name(subscriber_name, subscriber_op, content)

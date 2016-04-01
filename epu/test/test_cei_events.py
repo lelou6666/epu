@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import unittest
 import datetime
 import logging
@@ -13,6 +15,7 @@ import epu.cei_events as cei_events
 # many directories like /tmp/ceitestlog*
 DESTROY_LOGDIR = True
 
+
 class CEIEventsTestCase(unittest.TestCase):
 
     def setUp(self):
@@ -27,6 +30,9 @@ class CEIEventsTestCase(unittest.TestCase):
             return
         if not self._is_setup():
             raise Exception("tear down called without setup")
+        if self.logfilehandler:
+            self.log.removeHandler(self.logfilehandler)
+            self.logfilehandler.close()
         shutil.rmtree(self.logdirpath)
 
     def _configure(self):
@@ -39,13 +45,16 @@ class CEIEventsTestCase(unittest.TestCase):
         finally:
             if f:
                 f.close()
-
         logfilehandler = logging.FileHandler(logfilepath)
         logfilehandler.setLevel(logging.DEBUG)
         formatstring = "%(asctime)s %(levelname)s @%(lineno)d: %(message)s"
         logfilehandler.setFormatter(logging.Formatter(formatstring))
         self.log.addHandler(logfilehandler)
+<<<<<<< HEAD
 
+=======
+        self.logfilehandler = logfilehandler
+>>>>>>> refs/remotes/nimbusproject/master
         self.logfilepath = logfilepath
         self.logdirpath = tmpdir
 
@@ -56,8 +65,6 @@ class CEIEventsTestCase(unittest.TestCase):
         except:
             pass
         return False
-
-    # -----------------------------------------------------------------------
 
     def test_event_write(self):
         self.log.debug("something")
@@ -72,8 +79,11 @@ class CEIEventsTestCase(unittest.TestCase):
         cruft = "some cruft %s" % cei_events.event_logtxt("unittest", "TRIAL1")
         self.log.warning(cruft)
         events = cei_events.events_from_file(self.logfilepath)
-        assert len(events) == 1
 
+<<<<<<< HEAD
+=======
+        assert len(events) == 1
+>>>>>>> refs/remotes/nimbusproject/master
         cei_events.event("unittest", "TRIAL2", self.log)
         events = cei_events.events_from_file(self.logfilepath)
         assert len(events) == 2
@@ -84,9 +94,9 @@ class CEIEventsTestCase(unittest.TestCase):
         events = cei_events.events_from_file(self.logfilepath)
         assert len(events) == 3
 
-        found = {"TRIAL1":False, "TRIAL2":False, "TRIAL3":False}
+        found = {"TRIAL1": False, "TRIAL2": False, "TRIAL3": False}
         for ev in events:
-            if found.has_key(ev.name):
+            if ev.name in found:
                 found[ev.name] = True
         for val in found.values():
             assert val
@@ -97,7 +107,6 @@ class CEIEventsTestCase(unittest.TestCase):
         events = cei_events.events_from_file(self.logfilepath)
         assert len(events) == 1
         ts = events[0].timestamp
-
         # It is possible that any of these values could have rolled over
         # between acquiring utc_now and recording the event.  But this is
         # unlikely enough that we'll keep this important UTC sanity check:
@@ -122,23 +131,35 @@ class CEIEventsTestCase(unittest.TestCase):
         assert len(uniqs) == 7
 
     def test_extra(self):
+<<<<<<< HEAD
         adict = {"hello1":"hello2"}
+=======
+        adict = {"hello1": "hello2"}
+>>>>>>> refs/remotes/nimbusproject/master
         cei_events.event("unittest", "TRIAL1", self.log, extra=adict)
         events = cei_events.events_from_file(self.logfilepath)
         assert len(events) == 1
         assert events[0].extra["hello1"] == "hello2"
 
     def test_bad_extra(self):
+<<<<<<< HEAD
         self.assertRaises(Exception, cei_events.event,
                           "unittest", "TRIAL1", self.log, extra="astring")
 
     def test_extra_integer_values(self):
         adict = {"hello1":34}
+=======
+        self.assertRaises(Exception, cei_events.event, "unittest", "TRIAL1", self.log, extra="astring")
+
+    def test_extra_integer_values(self):
+        adict = {"hello1": 34}
+>>>>>>> refs/remotes/nimbusproject/master
         cei_events.event("unittest", "TRIAL1", self.log, extra=adict)
         events = cei_events.events_from_file(self.logfilepath)
         assert len(events) == 1
         assert events[0].extra["hello1"] == 34
 
+<<<<<<< HEAD
     def test_extra_integer_keys(self):
         # This does not serialize as an integer, fails.  Added rule
         # to events recorder to not allow integer keys.
@@ -154,17 +175,23 @@ class CEIEventsTestCase(unittest.TestCase):
         innerdict = {"hello3":"hello4"}
         adict = {"hello1":"hello2", "hello5":innerdict, "hello3":"hello6"}
 
+=======
+    def test_extra_hierarchy(self):
+        # note the conflicting "hello3" key in higher level:
+        innerdict = {"hello3": "hello4"}
+        adict = {"hello1": "hello2", "hello5": innerdict, "hello3": "hello6"}
+>>>>>>> refs/remotes/nimbusproject/master
         cei_events.event("unittest", "TRIAL1", self.log, extra=adict)
         events = cei_events.events_from_file(self.logfilepath)
-        assert len(events) == 1
-        assert events[0].extra["hello1"] == "hello2"
-        assert events[0].extra["hello3"] == "hello6"
-
-        innerdict = events[0].extra["hello5"]
+        event = events[0]
+        assert event.extra["hello1"] == "hello2"
+        assert event.extra["hello3"] == "hello6"
+        innerdict = event.extra["hello5"]
         assert isinstance(innerdict, dict)
         assert innerdict["hello3"] == "hello4"
 
     def test_newline_rules(self):
+<<<<<<< HEAD
         self.assertRaises(Exception, cei_events.event,
                           "unit\ntest", "TRIAL", self.log)
         self.assertRaises(Exception, cei_events.event,
@@ -183,6 +210,18 @@ class CEIEventsTestCase(unittest.TestCase):
                           None, "TRIAL", self.log)
         self.assertRaises(Exception, cei_events.event,
                           "unittest", None, self.log)
+=======
+        self.assertRaises(Exception, cei_events.event, "unit\ntest", "TRIAL", self.log)
+        self.assertRaises(Exception, cei_events.event, "unittest", "TRIAL\nA", self.log)
+        self.assertRaises(Exception, cei_events.event, "unittest", "TRIAL", self.log, extra="some\nthing")
+        self.assertRaises(Exception, cei_events.event, "unittest\n", "TRIAL", self.log)
+        self.assertRaises(Exception, cei_events.event, "\nunittest", "TRIAL", self.log)
+        self.assertRaises(Exception, cei_events.event, "\n", "TRIAL", self.log)
+
+    def test_missing_rules(self):
+        self.assertRaises(Exception, cei_events.event, None, "TRIAL", self.log)
+        self.assertRaises(Exception, cei_events.event, "unittest", None, self.log)
+>>>>>>> refs/remotes/nimbusproject/master
 
     def test_event_namefilter(self):
         cei_events.event("unittest", "NM1", self.log)

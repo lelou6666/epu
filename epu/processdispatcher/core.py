@@ -1,13 +1,32 @@
+# Copyright 2013 University of Chicago
+
 import logging
 
-from epu.states import InstanceState, ProcessState
-from epu.exceptions import NotFoundError, WriteConflictError
-from epu.processdispatcher.util import node_id_from_eeagent_name, \
-    node_id_to_eeagent_name
+from epu.states import InstanceState, ProcessState, ExecutionResourceState
+from epu.exceptions import NotFoundError, WriteConflictError, BadRequestError
+from epu.processdispatcher.engines import engine_id_from_domain
+from epu.util import is_valid_identifier, parse_datetime, ceiling_datetime
 from epu.processdispatcher.store import ProcessRecord, NodeRecord, \
-    ResourceRecord
+    ResourceRecord, ProcessDefinitionRecord
+from epu.processdispatcher.modes import RestartMode
+from epu.processdispatcher.util import get_process_state_message, \
+    get_set_difference_debug_message
+from epu.processdispatcher.engines import EngineSpec
 
 log = logging.getLogger(__name__)
+
+_WRITE_CONFLICT_RETRIES = 5
+
+
+def validate_owner_upid(owner, upid):
+    # so far we don't enforce owner since it isn't used for anything
+    if not is_valid_identifier(upid):
+        raise BadRequestError("invalid upid")
+
+
+def validate_definition_id(definition_id):
+    if not is_valid_identifier(definition_id):
+        raise BadRequestError("invalid definition_id")
 
 
 class ProcessDispatcherCore(object):
@@ -38,10 +57,9 @@ class ProcessDispatcherCore(object):
 
     """
 
-    def __init__(self, name, store, ee_registry, eeagent_client, notifier):
+    def __init__(self, store, ee_registry, eeagent_client, notifier):
         """
 
-        @param name:
         @param store:
         @type store: ProcessDispatcherStore
         @param ee_registry:
@@ -49,22 +67,53 @@ class ProcessDispatcherCore(object):
         @param notifier:
         @return:
         """
-        self.name = name
         self.store = store
         self.ee_registry = ee_registry
         self.eeagent_client = eeagent_client
         self.notifier = notifier
 
-    def dispatch_process(self, owner, upid, spec, subscribers, constraints=None, immediate=False):
-        """Dispatch a new process into the system
+    def set_system_boot(self, system_boot):
+        """Operation used at the end of a launch to disable system boot mode
+
+        Currently it is only ever really set to False via this operation. It is set
+        to True by directly writing to ZooKeeper before any PD services are started.
+        """
+        if system_boot is not False and system_boot is not True:
+            raise BadRequestError("expected a boolean value for system boot")
+        self.store.set_system_boot(system_boot)
+
+    def create_definition(self, definition_id, definition_type, executable,
+                          name=None, description=None):
+        validate_definition_id(definition_id)
+        definition = ProcessDefinitionRecord.new(definition_id,
+            definition_type, executable, name=name, description=description)
+        log.debug("creating definition %s" % definition)
+        self.store.add_definition(definition)
+
+    def describe_definition(self, definition_id):
+        validate_definition_id(definition_id)
+        return self.store.get_definition(definition_id)
+
+    def update_definition(self, definition_id, definition_type, executable,
+                          name=None, description=None):
+        validate_definition_id(definition_id)
+        definition = ProcessDefinitionRecord.new(definition_id,
+            definition_type, executable, name=name, description=description)
+        self.store.update_definition(definition)
+
+    def remove_definition(self, definition_id):
+        validate_definition_id(definition_id)
+        self.store.remove_definition(definition_id)
+
+    def list_definitions(self):
+        return self.store.list_definition_ids()
+
+    def create_process(self, owner, upid, definition_id, name=None):
+        """Create a new process in the system
 
         @param upid: unique process identifier
-        @param spec: description of what is started
-        @param subscribers: where to send status updates of this process
-        @param constraints: optional scheduling constraints (IaaS site? other stuff?)
-        @param immediate: don't provision new resources if no slots are available
-        @rtype: ProcessRecord
-        @return: description of process launch status
+        @param definition_id: process definition to start
+        @param name: a (hopefully) human recognizable name for the process
 
 
         Retry
@@ -75,22 +124,144 @@ class ProcessDispatcherCore(object):
         it thinks has already been acknowledged, it will return the current
         state of the process.
         """
+        validate_owner_upid(owner, upid)
+        validate_definition_id(definition_id)
 
+        # if not a real def, a NotFoundError will bubble up to caller
+        definition = self.store.get_definition(definition_id)
+        if definition is None:
+            raise NotFoundError("Couldn't find process definition %s in store" % definition_id)
 
-        #TODO validate inputs
-        process = ProcessRecord.new(owner, upid, spec, ProcessState.REQUESTED,
-            constraints, subscribers, immediate=immediate)
+        process = ProcessRecord.new(owner, upid, definition,
+            ProcessState.UNSCHEDULED, name=name)
 
-        existed = False
         try:
             self.store.add_process(process)
         except WriteConflictError:
             process = self.store.get_process(owner, upid)
-            existed = True
 
-        if not existed:
-            log.debug("Enqueing process %s", upid)
-            self.store.enqueue_process(owner, upid, process.round)
+            if not process:
+                raise BadRequestError("process exists but cannot be found")
+
+            # check parameters from call against process record in store.
+            # if they don't match, the caller probably has a coding error
+            # and is reusing upids or something.
+            if name is not None and process.name != name:
+                raise BadRequestError("process %s exists with different name '%s'" %
+                    (upid, process.name))
+            if definition_id != process.definition['definition_id']:
+                raise BadRequestError("process %s exists with different definition_id '%s'" %
+                    (upid, process.definition['definition_id']))
+        return process
+
+    def schedule_process(self, owner, upid, definition_id=None,
+                         configuration=None, subscribers=None,
+                         constraints=None, queueing_mode=None,
+                         restart_mode=None, execution_engine_id=None,
+                         node_exclusive=None, name=None):
+        """Schedule a process for execution
+
+        @param upid: unique process identifier
+        @param definition_id: process definition to start
+        @param configuration: process configuration
+        @param subscribers: where to send status updates of this process
+        @param constraints: optional scheduling constraints
+        @param queueing_mode: when a process can be queued
+        @param restart_mode: when and if failed/terminated procs should be restarted
+        @param execution_engine_id: dispatch a process to a specific eea
+        @param node_exclusive: property that will only be permitted once on a node
+        @param name: a (hopefully) human recognizable name for the process
+        @rtype: ProcessRecord
+        @return: description of process launch status
+
+        If an unknown process is specified and a definition_id is included,
+        this operation will create and schedule the process. If the process
+        already exists, it will be scheduled.
+
+        Retry
+        =====
+        If a call to this operation times out without a reply, it can safely
+        be retried. The upid and other parameters will be used to ensure that
+        nothing is repeated. If the service fields an operation request that
+        it thinks has already been acknowledged, it will return the current
+        state of the process.
+        """
+
+        validate_owner_upid(owner, upid)
+
+        if constraints is None:
+            constraints = {}
+        if execution_engine_id:
+            constraints['engine'] = execution_engine_id
+
+        process_updates = dict(configuration=configuration,
+            subscribers=subscribers, constraints=constraints,
+            queueing_mode=queueing_mode, restart_mode=restart_mode,
+            node_exclusive=node_exclusive, name=name)
+
+        process = self.store.get_process(owner, upid)
+
+        for _ in range(_WRITE_CONFLICT_RETRIES):
+
+            if process is None:
+                # if process is new but definition is specified, we create and
+                # schedule the process in one call. Without a definition it is
+                # an error.
+                if not definition_id:
+                    raise NotFoundError("process %s does not exist" % upid)
+                process = self.create_process(owner, upid,
+                    definition_id=definition_id, name=name)
+                process.update(process_updates)
+                process.state = ProcessState.REQUESTED
+
+            # if the process existed, but is being scheduled for the first time
+            elif process.state == ProcessState.UNSCHEDULED:
+                if definition_id:
+                    validate_definition_id(definition_id)
+
+                    definition = process.definition
+                    if not definition or not definition.get('definition_id'):
+                        raise BadRequestError("process %s exists but has no definition")
+
+                    if definition_id != definition['definition_id']:
+                        raise BadRequestError(
+                            "process %s definition_id %s doesn't match request"
+                            % (upid, definition_id))
+
+                process.update(process_updates)
+                process.state = ProcessState.REQUESTED
+
+            # if the process is dead in a terminal state and is to be started.
+            # we need to increment the process round number.
+            elif process.state in ProcessState.TERMINAL_STATES:
+                process.update(process_updates)
+                process.state = ProcessState.REQUESTED
+                process.round = process.round + 1
+
+            # if the process is already in play, it is ok for this operation
+            # to be repeated. however it must have the same parameters or else
+            # that is likely a programming error on the caller's part.
+            else:
+                _check_process_schedule_idempotency(process, process_updates)
+                # process record matches the request. no update is needed.
+                break
+
+            try:
+                self.store.update_process(process)
+                # once we successfully update the process, get out of the loop
+                break
+
+            except WriteConflictError:
+                process = self.store.get_process(owner, upid)
+
+        else:
+            raise BadRequestError("process %s could not be updated" % (upid,))
+
+        # always enqueue the process, even if it is probably already in the
+        # queue. this is harmless and provides an easy way to "nudge" matchmaking
+        # along in the face of bugs.
+        log.debug("Enqueing process %s", upid)
+        self.store.enqueue_process(owner, upid, process.round)
 
         return process
 
@@ -127,9 +298,12 @@ class ProcessDispatcherCore(object):
         be retried. Restarting of processes should be an idempotent operation
         here and at the EEAgent.
         """
+        validate_owner_upid(owner, upid)
 
-        #TODO process might not exist
         process = self.store.get_process(owner, upid)
+        if process is None:
+            raise NotFoundError("process %s does not exist" % upid)
+
         if process.state != ProcessState.RUNNING:
             log.warning("Tried to restart a process that isn't RUNNING")
             return process
@@ -148,7 +322,6 @@ class ProcessDispatcherCore(object):
 
         self.eeagent_client.restart_process(process.assigned, upid,
                                               process.round)
-
 
         return process
 
@@ -169,13 +342,19 @@ class ProcessDispatcherCore(object):
         here and at the EEAgent. It is important that eeids not be repeated to
         faciliate this.
         """
+        validate_owner_upid(owner, upid)
 
-        #TODO process might not exist
         process = self.store.get_process(owner, upid)
+        if process is None:
+            raise NotFoundError("process %s does not exist" % upid)
 
-        if process.state >= ProcessState.TERMINATED:
+        # if the process is already at rest -- UNSCHEDULED, or REJECTED
+        # for example -- we do nothing and leave the process state as is.
+        if process.state in ProcessState.TERMINAL_STATES:
             return process
 
+        # unassigned processes can just be marked as terminated, but note
+        # that we may be racing with the matchmaker.
         if process.assigned is None:
 
             # there could be a race where the process is assigned just
@@ -192,6 +371,8 @@ class ProcessDispatcherCore(object):
                     process = self.store.get_process(process.owner,
                                                      process.upid)
             if updated:
+                log.info(get_process_state_message(process))
+                self.notifier.notify_process(process)
 
                 # also try to remove process from queue
                 try:
@@ -203,40 +384,34 @@ class ProcessDispatcherCore(object):
                 # EARLY RETURN: the process was never assigned to a resource
                 return process
 
-        self.eeagent_client.terminate_process(process.assigned, upid,
-                                              process.round)
-
         # same as above: we want to mark the process as terminating but
         # other players may also be updating this record. we keep trying
         # in the face of conflict until the process is >= TERMINATING --
         # but note that it may be another worker that actually makes the
-        # write. For example the heartbeat could be received and processed
-        # remarkably quickly and the process could go right to TERMINATED.
-        while process.state < ProcessState.TERMINATING:
-            process.state = ProcessState.TERMINATING
-            try:
-                self.store.update_process(process)
-            except WriteConflictError:
-                process = self.store.get_process(process.owner, process.upid)
+        # write.
+        self.process_change_state(process, ProcessState.TERMINATING)
+
+        self.eeagent_client.terminate_process(process.assigned, upid,
+                                              process.round)
 
         return process
 
-    def dt_state(self, node_id, deployable_type, state, properties=None):
+    def node_state(self, node_id, domain_id, state, properties=None):
         """
-        Handle updates about available instances of deployable types.
+        Handle updates about available domain nodes.
 
         @param node_id: unique instance identifier
-        @param deployable_type: type of instance
+        @param domain_id: domain of instance
         @param state: EPU state of instance
         @param properties: Optional properties about this instance
         @return:
 
         This operation is the recipient of a "subscription" the PD makes to
-        DT state updates. Calls to this operation are NOT RPC-style.
+        domain state updates. Calls to this operation are NOT RPC-style.
 
         This information is used for two purposes:
 
-            1. To correlate EE agent heartbeats with a DT and various deploy
+            1. To correlate EE agent heartbeats with a node and various deploy
                information (site, allocation, security groups, etc).
 
             2. To detect EEs which have been killed due to underlying death
@@ -245,8 +420,8 @@ class ProcessDispatcherCore(object):
 
         if state == InstanceState.RUNNING:
             node = self.store.get_node(node_id)
-            if not node:
-                node = NodeRecord.new(node_id, deployable_type, properties)
+            if node is None:
+                node = NodeRecord.new(node_id, domain_id, properties)
 
                 try:
                     self.store.add_node(node)
@@ -255,79 +430,136 @@ class ProcessDispatcherCore(object):
                     # no big deal.
                     return
 
-                log.info("DT resource %s is %s", node_id, state)
+                log.info("Domain %s node %s is %s", domain_id, node_id, state)
 
         elif state in (InstanceState.TERMINATING, InstanceState.TERMINATED):
             # reschedule processes running on node
 
             node = self.store.get_node(node_id)
             if node is None:
-                log.warn("Got dt_state for unknown node %s in state %s",
+                log.warn("got state for unknown node %s in state %s",
                          node_id, state)
                 return
+            self.evacuate_node(node)
 
-            resource_id = node_id_to_eeagent_name(node_id)
+    def evacuate_node(self, node, is_system_restart=False,
+                      dead_process_state=None, rescheduled_process_state=None):
+        """Remove a node and reschedule its processes as needed
+
+        dead_process_state: the state non-restartable processes are moved to.
+            defaults to FAILED
+        rescheduled_process_state: the state restartable processes are moved to.
+            defaults to REQUESTED
+        """
+        node_id = node.node_id
+
+        for resource_id in node.resources:
             resource = self.store.get_resource(resource_id)
 
             if not resource:
-                log.warn("Got dt_state for node without a resource")
+                log.warn("Node has unknown resource %s", node_id, resource_id)
+                continue
+
             else:
-
                 # mark resource ineligible for scheduling
-                self._disable_resource(resource)
+                self.resource_change_state(resource, ExecutionResourceState.DISABLED)
 
-                # go through and reschedule processes as needed
-                for owner, upid, round in resource.assigned:
-                    self._evacuate_process(owner, upid, resource)
+                self.evacuate_resource(
+                    resource,
+                    is_system_restart=is_system_restart,
+                    dead_process_state=dead_process_state,
+                    rescheduled_process_state=rescheduled_process_state,
+                    update_node_exclusive=False)
+                # node is going away, so we don't bother updating node exclusive
 
-            try:
-                self.store.remove_node(node_id)
-            except NotFoundError:
-                pass
             try:
                 self.store.remove_resource(resource_id)
             except NotFoundError:
                 pass
 
-    def _disable_resource(self, resource):
-        while resource.enabled:
-            resource.enabled = False
+        try:
+            self.store.remove_node(node_id)
+        except NotFoundError:
+            pass
+
+    def evacuate_resource(self, resource, is_system_restart=False,
+                      dead_process_state=None, rescheduled_process_state=None,
+                      update_node_exclusive=True):
+        """Remove and reschedule processes from a resource
+
+        This assumes the resource is already disabled or is otherwise prevented
+        from being assigned any new processes
+        """
+
+        processes = []
+        for owner, upid, round in resource.assigned:
+            process = self.store.get_process(owner, upid)
+            if process:
+                processes.append(process)
+
+        # update node exclusive tags first, in case we die partway through this
+        # operation. on recovery it should be retried and we don't want to leave
+        # node exclusives orphaned.
+        if update_node_exclusive:
+            to_remove = [p.node_exclusive for p in processes if p.node_exclusive]
+            if to_remove:
+                node = self.store.get_node(resource.node_id)
+                if node:
+                    self.node_remove_exclusive_tags(node, to_remove)
+
+        # now go through and evacuate each process
+        for process in processes:
+            self._evacuate_process(process, resource,
+                is_system_restart=is_system_restart,
+                dead_process_state=dead_process_state,
+                rescheduled_process_state=rescheduled_process_state)
+
+        self._clear_resource_assignments(resource)
+
+    def _clear_resource_assignments(self, resource):
+        """Clear resource assignments as long as state doesn't return to OK
+        """
+        updated = False
+        while resource and resource.state != ExecutionResourceState.OK and resource.assigned:
+            resource.assigned = []
             try:
                 self.store.update_resource(resource)
+                updated = True
+            except NotFoundError:
+                resource = None
             except WriteConflictError:
-                resource = self.store.get_resource(resource_id)
+                try:
+                    resource = self.store.get_resource(resource.resource_id)
+                except NotFoundError:
+                    resource = None
+        return resource, updated
 
-    def _evacuate_process(self, owner, upid, resource):
+    def _evacuate_process(self, process, resource, is_system_restart=False,
+            dead_process_state=None, rescheduled_process_state=None):
         """Deal with a process on a terminating/terminated node
         """
-        process = self.store.get_process(owner, upid)
-        if process is None:
-            return
-
-        # send a last ditch terminate just in case
-        if process.state < ProcessState.TERMINATED:
-            self.eeagent_client.terminate_process(resource.resource_id,
-                upid,
-                process.round)
+        if not dead_process_state:
+            dead_process_state = ProcessState.FAILED
 
         if process.state == ProcessState.TERMINATING:
-            #what luck. the process already wants to die.
-            process, updated = self._change_process_state(
+            # what luck. the process already wants to die.
+            process, updated = self.process_change_state(
                 process, ProcessState.TERMINATED)
-            if updated:
-                self.notifier.notify_process(process)
 
         elif process.state < ProcessState.TERMINATING:
-            log.debug("Rescheduling process %s from terminating node %s",
-                upid, resource.node_id)
+            if self.process_should_restart(process, dead_process_state,
+                    is_system_restart=is_system_restart):
+                log.debug("Rescheduling process %s from evacuated resource %s on node %s",
+                    process.upid, resource.resource_id, resource.node_id)
+                if rescheduled_process_state:
+                    self.process_next_round(process,
+                        newstate=rescheduled_process_state)
+                else:
+                    self.process_next_round(process)
+            else:
+                self.process_change_state(process, dead_process_state, assigned=None)
 
-            process, updated = self._process_next_round(process)
-            if updated:
-                self.notifier.notify_process(process)
-                self.store.enqueue_process(process.owner, process.upid,
-                    process.round)
-
-    def ee_heartbeart(self, sender, beat):
+    def ee_heartbeat(self, sender, beat):
         """Incoming heartbeat from an EEAgent
 
         @param sender: ION name of sender
@@ -345,24 +577,41 @@ class ProcessDispatcherCore(object):
             - processes - list of running process IDs
         """
 
+        # sender can be in the format $sysname.$eename when CFG.dashi.sysname
+        # is set, or it will be just $eename, if there is no sysname set.
+        # We need to make sure that we remove the sysname when it is enabled to
+        # get the correct eeagent name.
+        if '.' in sender:
+            sender = sender.split('.')[-1]
         resource = self.store.get_resource(sender)
         if resource is None:
             # first heartbeat from this EE
-            self._first_heartbeat(sender)
-            return #  *** EARLY RETURN **
+            self._first_heartbeat(sender, beat)
+            return  # *** EARLY RETURN **
+
+        resource_updated = False
+
+        timestamp_str = beat['timestamp']
+        timestamp = ceiling_datetime(parse_datetime(timestamp_str))
+
+        resource_timestamp = resource.last_heartbeat_datetime
+        if resource_timestamp is None or timestamp > resource_timestamp:
+            resource.new_last_heartbeat_datetime(timestamp)
+            resource_updated = True
 
         assigned_procs = set()
         processes = beat['processes']
+        node_exclusives_to_remove = []
         for procstate in processes:
             upid = procstate['upid']
-            round = procstate['round']
+            round = int(procstate['round'])
             state = procstate['state']
 
-            #TODO hack to handle how states are formatted in EEAgent heartbeat
-            if isinstance(state, (list,tuple)):
+            # TODO hack to handle how states are formatted in EEAgent heartbeat
+            if isinstance(state, (list, tuple)):
                 state = "-".join(str(s) for s in state)
 
-            #TODO owner?
+            # TODO owner?
             process = self.store.get_process(None, upid)
             if not process:
                 log.warn("EE reports process %s that is unknown!", upid)
@@ -377,7 +626,10 @@ class ProcessDispatcherCore(object):
             if round < process.round:
                 # skip heartbeat info for processes that are already redeploying
                 # but send a cleanup request first
-                self.eeagent_client.cleanup_process(sender, upid, round)
+                if state < ProcessState.TERMINATED:
+                    self.eeagent_client.terminate_process(sender, upid, round)
+                else:
+                    self.eeagent_client.cleanup_process(sender, upid, round)
                 continue
 
             if state == process.state:
@@ -390,46 +642,42 @@ class ProcessDispatcherCore(object):
 
                 continue
 
-            if process.state == ProcessState.PENDING and \
-               state == ProcessState.RUNNING:
+            if process.state in (ProcessState.ASSIGNED, ProcessState.PENDING) and \
+               state in (ProcessState.PENDING, ProcessState.RUNNING):
 
-                log.info("Process %s is %s", upid, state)
                 assigned_procs.add(process.key)
 
-                # mark as running and notify subscriber
-                process, changed = self._change_process_state(
-                    process, ProcessState.RUNNING)
+                process, changed = self.process_change_state(
+                    process, state)
 
-                if changed:
-                    self.notifier.notify_process(process)
+                try:
+                    self.store.remove_queued_process(process.owner,
+                        process.upid, process.round)
+                except NotFoundError:
+                    pass
 
             elif state in (ProcessState.TERMINATED, ProcessState.FAILED,
                            ProcessState.EXITED):
 
                 # process has died in resource. Obvious culprit is that it was
                 # killed on request.
-                log.info("Process %s is %s", upid, state)
+
+                if process.node_exclusive:
+                    node_exclusives_to_remove.append(process.node_exclusive)
 
                 if process.state == ProcessState.TERMINATING:
                     # mark as terminated and notify subscriber
-                    process, updated = self._change_process_state(
+                    process, updated = self.process_change_state(
                         process, ProcessState.TERMINATED, assigned=None)
-                    if updated:
-                        self.notifier.notify_process(process)
 
-                # otherwise it needs to be rescheduled
-                elif process.state in (ProcessState.PENDING,
+                # otherwise it may need to be rescheduled
+                elif process.state in (ProcessState.ASSIGNED, ProcessState.PENDING,
                                     ProcessState.RUNNING):
 
-                    #TODO: This might not be the optimal behavior here. 
-                    # Previously this would restart the process.
-
-                    # update state and notify subscriber
-                    process, changed = self._change_process_state(process,
-                        state, assigned=None)
-
-                    if changed:
-                        self.notifier.notify_process(process)
+                    if self.process_should_restart(process, state):
+                        self.process_next_round(process)
+                    else:
+                        self.process_change_state(process, state, assigned=None)
 
                 # send cleanup request to EEAgent now that we have dealt
                 # with the dead process
@@ -438,85 +686,248 @@ class ProcessDispatcherCore(object):
         new_assigned = []
         for owner, upid, round in resource.assigned:
             key = (owner, upid, round)
-            if key in assigned_procs:
-                new_assigned.append(key)
-                continue
-
             process = self.store.get_process(owner, upid)
 
+            if key in assigned_procs:
+                new_assigned.append(key)
             # prune process assignments once the process has terminated or
             # moved onto the next round
-            if (process and process.round == round
-                and process.state < ProcessState.TERMINATED):
+            elif (process and process.round == round
+                 and process.state < ProcessState.TERMINATED):
                 new_assigned.append(key)
 
         if len(new_assigned) != len(resource.assigned):
-            log.debug("updating resource %s assignments. was %s, now %s",
-                resource.resource_id, resource.assigned, new_assigned)
+            # first update node exclusive tags
+            if node_exclusives_to_remove:
+                node = self.store.get_node(resource.node_id)
+                if node:
+                    self.node_remove_exclusive_tags(node, node_exclusives_to_remove)
+                else:
+                    log.warning("Node %s not found while attempting to update node_exclusive",
+                        resource.node_id)
+
+            if log.isEnabledFor(logging.DEBUG):
+                old_assigned_set = set(tuple(item) for item in resource.assigned)
+                new_assigned_set = set(tuple(item) for item in new_assigned)
+                difference_message = get_set_difference_debug_message(
+                    old_assigned_set, new_assigned_set)
+                log.debug("updating resource %s assignments: %s",
+                    resource.resource_id, difference_message)
+
             resource.assigned = new_assigned
+            resource_updated = True
+
+        if resource_updated:
             try:
                 self.store.update_resource(resource)
             except (WriteConflictError, NotFoundError):
-                #TODO? right now this will just wait for the next heartbeat
+                # TODO? right now this will just wait for the next heartbeat
                 pass
-        
-    def _first_heartbeat(self, sender):
 
-        node_id = node_id_from_eeagent_name(sender)
+    def process_should_restart(self, process, exit_state, is_system_restart=False):
+
+        config = process.configuration
+        if is_system_restart and config:
+            try:
+                process_config = config.get('process')
+                if process_config and process_config.get('omit_from_system_restart'):
+                    return False
+            except Exception:
+                # don't want a weird process config structure to blow up PD
+                log.exception("Error inspecting process config")
+        should_restart = False
+        if process.restart_mode is None or process.restart_mode == RestartMode.ABNORMAL:
+            if exit_state != ProcessState.EXITED:
+                should_restart = True
+
+        elif process.restart_mode == RestartMode.ALWAYS:
+            should_restart = True
+
+        return should_restart
+
+    def resource_change_state(self, resource, newstate):
+        updated = False
+        while resource and resource.state not in (ExecutionResourceState.DISABLED, newstate):
+            resource.state = newstate
+            try:
+                self.store.update_resource(resource)
+                updated = True
+            except NotFoundError:
+                resource = None
+            except WriteConflictError:
+                try:
+                    resource = self.store.get_resource(resource.resource_id)
+                except NotFoundError:
+                    resource = None
+        return resource, updated
+
+    def _first_heartbeat(self, sender, beat):
+
+        node_id = beat.get('node_id')
+        if not node_id:
+            log.error("EE heartbeat from %s without a node_id!: %s", sender, beat)
+            return
 
         node = self.store.get_node(node_id)
         if node is None:
-            log.warn("EE heartbeat from unknown node. Still booting? "+
-                     "node_id=%s sender=%s", node_id, sender)
+            log.warn("EE heartbeat from unknown node. Still booting? " +
+                     "node_id=%s sender=%s.", node_id, sender)
 
             # TODO I'm thinking the best thing to do here is query EPUM
-            # for the state of this node in case the initial dt_state
+            # for the state of this node in case the initial node_state
             # update got lost. Note that we shouldn't go ahead and
             # schedule processes onto this EE until we get the RUNNING
-            # dt_state update -- there could be a failure later on in
+            # node_state update -- there could be a failure later on in
             # the contextualization process that triggers the node to be
             # terminated.
 
             return
-
-        log.info("Got first heartbeat from EEAgent %s on node %s",
-            sender, node_id)
 
         if node.properties:
             properties = node.properties.copy()
         else:
             properties = {}
 
-        engine_spec = self.ee_registry.get_engine_by_dt(node.deployable_type)
+        log.info("First heartbeat from EEAgent %s on node %s (%s)",
+            sender, node_id, properties.get("hostname", "unknown hostname"))
+
+        try:
+            engine_id = engine_id_from_domain(node.domain_id)
+        except ValueError:
+            log.exception("Node for EEagent %s has invalid domain_id!", sender)
+            return
+
+        engine_spec = self.get_engine(engine_id)
         slots = engine_spec.slots
 
         # just making engine type a generic property/constraint for now,
         # until it is clear something more formal is needed.
-        properties['engine_type'] = engine_spec.engine_id
+        properties['engine'] = engine_id
+
+        try:
+            self.node_add_resource(node, sender)
+        except NotFoundError:
+            log.warn("Node removed while processing heartbeat. ignoring. "
+                     "node_id=%s sender=%s.", node_id, sender)
+            return
+
+        timestamp_str = beat['timestamp']
+        timestamp = ceiling_datetime(parse_datetime(timestamp_str))
 
         resource = ResourceRecord.new(sender, node_id, slots, properties)
+        resource.new_last_heartbeat_datetime(timestamp)
         try:
             self.store.add_resource(resource)
         except WriteConflictError:
             # no problem if this resource was just created by another worker
             log.info("Conflict writing new resource record %s. Ignoring.", sender)
 
-    def _process_next_round(self, process):
+    def get_resource_engine(self, resource):
+        """Return an execution engine spec for a resource
+        """
+        engine_id = resource.properties.get('engine')
+        if not engine_id:
+            raise ValueError("Resource has no engine property")
+        return self.get_engine(engine_id)
+
+    def get_engine(self, engine_id):
+        """Return an execution engine spec object
+        """
+        return self.ee_registry.get_engine_by_id(engine_id)
+
+    def node_add_resource(self, node, resource_id):
+        """Tentatively adds a resource to a node, retrying if conflict
+
+        Note that this may raise NotFoundError if the node is removed before
+        completion
+        """
+        updated = False
+        while resource_id not in node.resources:
+            node.resources.append(resource_id)
+            try:
+                self.store.update_node(node)
+                updated = True
+            except WriteConflictError:
+                node = self.store.get_node(node.node_id)
+
+        return node, updated
+
+    def node_add_exclusive_tags(self, node, tags):
+        """Add node exclusive tags to a node
+
+        Will retry as long as node exists and tags are not present.
+        Raises a NotFoundError if node record is removed
+        """
+        log.debug("Adding node %s node_exclusive tags: %s", node.node_id, tags)
+        while True:
+            update_needed = False
+            for tag in tags:
+                tag = str(tag)
+                if tag not in node.node_exclusive:
+                    node.node_exclusive.append(tag)
+                    update_needed = True
+
+            if not update_needed:
+                return node, False  # nothing to update
+
+            try:
+                self.store.update_node(node)
+                return node, True
+
+            except WriteConflictError:
+                node = self.store.get_node(node.node_id)
+
+    def node_remove_exclusive_tags(self, node, tags):
+        """Remove node exclusive tags from a node record
+
+        Will retry as long as node exists and tags are present.
+        """
+        log.debug("Removing node %s node_exclusive tags: %s", node.node_id, tags)
+        while True:
+            new_node_exclusive = [tag for tag in node.node_exclusive if tag not in tags]
+            if new_node_exclusive == node.node_exclusive:
+                return node, False  # nothing to update, tags are already gone
+
+            node.node_exclusive = new_node_exclusive
+            try:
+                self.store.update_node(node)
+                return node, True
+
+            except WriteConflictError:
+                node = self.store.get_node(node.node_id)
+            except NotFoundError:
+                # we don't care if the node was removed
+                return None, False
+
+    def process_next_round(self, process, newstate=ProcessState.DIED_REQUESTED, enqueue=True):
+        """Tentatively advance a process to the next round
+        """
+        assert newstate and newstate < ProcessState.TERMINATING
+
         cur_round = process.round
         updated = False
         while (process.state < ProcessState.TERMINATING and
                cur_round == process.round):
-            process.state = ProcessState.DIED_REQUESTED
+            process.state = newstate
             process.assigned = None
-            process.round = cur_round+1
+            process.round = cur_round + 1
             try:
                 self.store.update_process(process)
                 updated = True
+
+                log.info(get_process_state_message(process))
+
             except WriteConflictError:
                 process = self.store.get_process(process.owner, process.upid)
+
+        if updated:
+            if enqueue:
+                self.store.enqueue_process(process.owner, process.upid,
+                    process.round)
+            self.notifier.notify_process(process)
         return process, updated
 
-    def _change_process_state(self, process, newstate, **updates):
+    def process_change_state(self, process, newstate, **updates):
         """
         Tentatively update a process record
 
@@ -533,20 +944,55 @@ class ProcessDispatcherCore(object):
         cur_round = process.round
         updated = False
         while process.state < newstate and cur_round == process.round:
+            if newstate == ProcessState.RUNNING:
+                process.increment_starts()
             process.state = newstate
             process.update(updates)
             try:
                 self.store.update_process(process)
                 updated = True
+
+                # log as error when processes fail
+                if newstate == ProcessState.FAILED:
+                    log.error(get_process_state_message(process))
+                else:
+                    log.info(get_process_state_message(process))
+
             except WriteConflictError:
                 process = self.store.get_process(process.owner, process.upid)
 
+        if updated:
+            self.notifier.notify_process(process)
         return process, updated
+
+    def get_process_constraints(self, process):
+        """Returns a dict of process constraints
+
+        Includes constraints from the process itself as well as from the engine registry.
+
+        Guaranteed to at least include an engine in the constraints.
+        """
+        constraints = {}
+        engine_id = self.ee_registry.get_process_definition_engine_id(process.definition)
+        if process.constraints.get('engine') is not None:
+            engine_id = process.constraints.get('engine')
+
+        if engine_id is None:
+            engine_id = self.ee_registry.default
+
+        if engine_id is not None:
+            constraints['engine'] = engine_id
+
+        if process.constraints:
+            process.constraints.update(constraints)
+            constraints = process.constraints
+        return constraints
 
     def dump(self):
         resources = {}
+        nodes = {}
         processes = {}
-        state = dict(resources=resources, processes=processes)
+        state = dict(resources=resources, processes=processes, nodes=nodes)
 
         for resource_id in self.store.get_resource_ids():
             resource = self.store.get_resource(resource_id)
@@ -560,4 +1006,40 @@ class ProcessDispatcherCore(object):
                 continue
             processes[process.upid] = dict(process)
 
+        for node_id in self.store.get_node_ids():
+            node = self.store.get_node(node_id)
+            if not node:
+                continue
+            nodes[node_id] = dict(node)
+
         return state
+
+    def add_engine(self, definition):
+        try:
+            engine_id = definition['engine_id']
+            del(definition['engine_id'])
+        except KeyError:
+            raise BadRequestError("Definition must have an 'engine_id'")
+
+        try:
+            slots = definition['slots']
+            del(definition['slots'])
+        except KeyError:
+            raise BadRequestError("Definition must have 'slots'")
+
+        engine = EngineSpec(engine_id, slots, **definition)
+        self.ee_registry.add(engine)
+
+
+def _check_process_schedule_idempotency(process, parameters):
+    """Checks supplied parameters against an existing process object
+    """
+    for key, value in parameters.iteritems():
+        # name is for decoration only. it's convenient to ignore it here.
+        if key == "name":
+            continue
+        process_value = process.get(key)
+        if process_value != value:
+            raise BadRequestError(
+                "process %s is %s but %s parameter value doesn't match request"
+                % (process.upid, process.state, key))

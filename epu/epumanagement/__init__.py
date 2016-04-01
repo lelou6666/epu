@@ -1,8 +1,11 @@
+# Copyright 2013 University of Chicago
+
 import logging
 
 from epu.epumanagement.reactor import EPUMReactor
 from epu.epumanagement.doctor import EPUMDoctor
 from epu.epumanagement.decider import EPUMDecider
+<<<<<<< HEAD
 from epu.epumanagement.store import LocalEPUMStore
 from epu.epumanagement.core import DomainSubscribers
 from epu.epumanagement.conf import EPUM_INITIALCONF_EXTERNAL_DECIDE,\
@@ -10,8 +13,18 @@ from epu.epumanagement.conf import EPUM_INITIALCONF_EXTERNAL_DECIDE,\
     EPUM_INITIALCONF_DEFAULT_NEEDY_IAAS_ALLOC, CONF_IAAS_ALLOCATION,\
     PROVISIONER_VARS_KEY, EPUM_INITIALCONF_SERVICE_NAME, \
     EPUM_DEFAULT_SERVICE_NAME
+=======
+from epu.epumanagement.reaper import EPUMReaper
+from epu.epumanagement.core import DomainSubscribers
+from epu.epumanagement.conf import EPUM_INITIALCONF_EXTERNAL_DECIDE,\
+    EPUM_INITIALCONF_DEFAULT_NEEDY_IAAS,\
+    EPUM_INITIALCONF_DEFAULT_NEEDY_IAAS_ALLOC,\
+    PROVISIONER_VARS_KEY, EPUM_RECORD_REAPING_DEFAULT_MAX_AGE,\
+    EPUM_CONF_DECIDER_LOOP_INTERVAL, EPUM_DECIDER_DEFAULT_LOOP_INTERVAL
+>>>>>>> refs/remotes/nimbusproject/master
 
 log = logging.getLogger(__name__)
+
 
 class EPUManagement(object):
     """
@@ -23,7 +36,8 @@ class EPUManagement(object):
     in test/dev situations to bypass the messaging layer altogether.
     """
 
-    def __init__(self, initial_conf, notifier, provisioner_client, ouagent_client, epum_client=None):
+    def __init__(self, initial_conf, notifier, provisioner_client, ouagent_client, dtrs_client, epum_client=None,
+                 store=None, statsd_cfg=None):
         """Given a configuration, instantiate all EPUM roles and objects
 
         INITIAL_CONF dict:
@@ -37,14 +51,14 @@ class EPUManagement(object):
            "needy_default_iaas_allocation": If register-need does not include IaaS allocation
 
 
-        NOTE: there are NOT any initial EPU requests in the initial config.  EPUs are either
-              added by operations or tended to because of the recovery procedure.
-
         @param initial_conf All configurations as dict.
         @param notifier Subscriber notifier (See clients.py)
         @param provisioner_client ProvisionerClient instance (See clients.py)
         @param ouagent_client OUAgentClient instance (See clients.py)
+        @param dtrs_client DTRSClient
         @param epum_client EPUManagement client (See clients.py). If None, uses self (in-memory).
+        @param store EPUMStore implementation, or None
+        @param statsd_cfg statsd configuration dict, or None
         """
 
         self.initialized = False
@@ -59,6 +73,9 @@ class EPUManagement(object):
 
         if not provisioner_client:
             raise ValueError("Provisioner client is required")
+
+        if not dtrs_client:
+            raise ValueError("DTRS client is required")
 
         # See self.msg_register_need()
         self.needy_default_iaas_site = initial_conf.get(EPUM_INITIALCONF_DEFAULT_NEEDY_IAAS, None)
@@ -75,20 +92,36 @@ class EPUManagement(object):
 
         self.domain_subscribers = DomainSubscribers(notifier)
 
+<<<<<<< HEAD
         self.epum_store = LocalEPUMStore(self.service_name)
+=======
+        self.epum_store = store
+>>>>>>> refs/remotes/nimbusproject/master
 
         # The instance of the EPUManagementService process that hosts a particular EPUMReactor instance
         # might not be configured to receive messages.  But when it is receiving messages, they all go
         # to the EPUMReactor instance.
         self.reactor = EPUMReactor(self.epum_store, self.domain_subscribers, provisioner_client, epum_client)
+<<<<<<< HEAD
         
+=======
+
+>>>>>>> refs/remotes/nimbusproject/master
         # The instance of the EPUManagementService process that hosts a particular EPUMDecider instance
         # might not be the elected decider.  When it is the elected decider, its EPUMDecider instance
         # handles that functionality.  When it is not the elected decider, its EPUMDecider instance
         # handles being available in the election.
+<<<<<<< HEAD
         self.decider = EPUMDecider(self.epum_store, self.domain_subscribers,
             provisioner_client, epum_client, disable_loop=self._external_decide_mode,
             base_provisioner_vars=base_provisioner_vars)
+=======
+        decider_loop_interval = initial_conf.get(EPUM_CONF_DECIDER_LOOP_INTERVAL,
+            EPUM_DECIDER_DEFAULT_LOOP_INTERVAL)
+        self.decider = EPUMDecider(self.epum_store, self.domain_subscribers, provisioner_client, epum_client,
+                dtrs_client, disable_loop=self._external_decide_mode, base_provisioner_vars=base_provisioner_vars,
+                loop_interval=decider_loop_interval, statsd_cfg=statsd_cfg)
+>>>>>>> refs/remotes/nimbusproject/master
 
         # The instance of the EPUManagementService process that hosts a particular EPUMDoctor instance
         # might not be the elected leader.  When it is the elected leader, this EPUMDoctor handles that
@@ -96,6 +129,16 @@ class EPUManagement(object):
         # participation in the election.
         self.doctor = EPUMDoctor(self.epum_store, notifier, provisioner_client, epum_client,
                                  ouagent_client, disable_loop=self._external_decide_mode)
+
+        # The instance of the EPUManagementService process that hosts a particular EPUMReaper instance
+        # might not be the elected leader.  When it is the elected leader, this EPUMReaper handles that
+        # functionality.  When it is not the elected leader, this EPUMReaper handles the constant
+        # participation in the election.
+
+        record_reaping_max_age = initial_conf.get('record_reaping_max_age',
+                                                  EPUM_RECORD_REAPING_DEFAULT_MAX_AGE)
+        self.reaper = EPUMReaper(self.epum_store, record_reaping_max_age,
+                                 disable_loop=self._external_decide_mode)
 
     def initialize(self):
         """
@@ -107,12 +150,7 @@ class EPUManagement(object):
         # from persistence and refreshes local caches.
         self.doctor.recover()
         self.decider.recover()
-        
-        # The doctor and decider register themselves with EPUMStore for leader callbacks, it's not
-        # clear what the best ordering will be when ZK comes into play.  For now, we do the job
-        # for EPUMStore because these instances always are the leaders:
-        self.doctor.now_leader()
-        self.decider.now_leader()
+        self.reaper.recover()
 
         self.initialized = True
 
@@ -134,39 +172,18 @@ class EPUManagement(object):
             raise Exception("Not configured to accept external doctor check invocations")
         self.doctor._loop_top(timestamp=timestamp)
 
+    def _run_reaper_loop(self):
+        """For unit and integration tests only
+        """
+        if not self.initialized:
+            raise Exception("Not initialized")
+        if not self._external_decide_mode:
+            raise Exception("Not configured to accept external decision invocations")
+        self.reaper._loop_top()
+
     # -------------------------------------------
     # External Messages: Sent by other components
     # -------------------------------------------
-    
-    def msg_register_need(self, caller, dt_id, constraints, num_needed, subscriber_name, subscriber_op):
-        """ New in R2: A "strongly typed" sensor input concerning what DTs other components want.
-
-        @param caller Caller, if available
-        @param dt_id The needed Deployable Type ID
-        @param constraints Deployment constraints: IaaS site, allocations, etc.
-        @param num_needed Total number of needed DTs of this type
-        @param subscriber_name If requested
-        @param subscriber_op What to call; required if subscription requested
-        """
-        if not self.initialized:
-            raise Exception("Not initialized")
-        iaas_site = constraints.get(CONF_IAAS_SITE, self.needy_default_iaas_site)
-        iaas_alloc = constraints.get(CONF_IAAS_ALLOCATION, self.needy_default_iaas_alloc)
-        self.epum_store.new_need(num_needed, dt_id, iaas_site, iaas_alloc)
-        if subscriber_name and subscriber_op:
-            # If this (or previous new_need) fails to work then there is no one to notify about it
-            # So should register_need be RPC? (todo)
-            self.epum_store.needy_subscriber(dt_id, subscriber_name, subscriber_op)
-
-    def msg_retire_node(self, caller, node_id):
-        """ New in R2: A "strongly typed" sensor input concerning what DTs other components do NOT want.
-
-        @param caller Caller, if available
-        @param node_id The node that may be retired
-        """
-        if not self.initialized:
-            raise Exception("Not initialized")
-        self.epum_store.new_retirable(node_id)
 
     def msg_subscribe_domain(self, caller, domain_id, subscriber_name, subscriber_op):
         """Subscribe to asynchronous state updates for instances of a domain
@@ -180,7 +197,11 @@ class EPUManagement(object):
             subscriber_name, subscriber_op)
 
     def msg_unsubscribe_domain(self, caller, domain_id, subscriber_name):
+<<<<<<< HEAD
         """ New in R2: Unsubscribe to state updates about a particular DT ID.
+=======
+        """ New in R2: Unsubscribe to state updates about a particular domain
+>>>>>>> refs/remotes/nimbusproject/master
 
         @param caller Caller, if available
         @param domain_id The domain of interest
@@ -188,67 +209,71 @@ class EPUManagement(object):
         """
         return self.reactor.unsubscribe_domain(caller, domain_id, subscriber_name)
 
+<<<<<<< HEAD
     def msg_list_epus(self, caller):
         """Return a list of EPUs in the system
+=======
+    def msg_list_domains(self, caller):
+        """Return a list of domains in the system
+>>>>>>> refs/remotes/nimbusproject/master
         """
-        return self.reactor.list_epus(caller=caller)
+        return self.reactor.list_domains(caller)
 
-    def msg_describe_epu(self, caller, epu_name):
-        """Return a state structure for an EPU, or None
+    def msg_describe_domain(self, caller, domain_id):
+        """Return a state structure for a domain, or None
         """
-        return self.reactor.describe_epu(caller, epu_name)
+        return self.reactor.describe_domain(caller, domain_id)
 
-    def msg_add_epu(self, caller, epu_name, epu_config):
-        """ New in R2: Add a new EPU (logically separate Decision Engine).
+    def msg_add_domain(self, caller, domain_id, definition_id, config, subscriber_name=None,
+                    subscriber_op=None):
+        """Add a new Domain (logically separate Decision Engine).
 
-        SEE: msg_reconfigure_epu() documentation below
+        SEE: msg_reconfigure_domain() documentation below
 
         @param caller Caller, if available
-        @param epu_name EPU name/ID
-        @param epu_config Initial configuration, see msg_reconfigure_epu for config doc
+        @param domain_id domain name/ID
+        @param definition_id domain definition name/ID
+        @param config Initial configuration, see msg_reconfigure_domain for config doc
         """
         if not self.initialized:
             raise Exception("Not initialized")
-        self.reactor.add_epu(caller, epu_name, epu_config)
+        self.reactor.add_domain(caller, domain_id, definition_id, config,
+            subscriber_name=subscriber_name, subscriber_op=subscriber_op)
 
-        # TODO: when per-msg authorization is enabled in the future, only "self-sent" msgs should be
-        #       able to create EPUs with names beginning with "_".  (i.e., the needy engines)
-
-    def msg_remove_epu(self, caller, epu_name):
-        """ New in R2: Remove an EPU entirely.  All running instances of that EPU will be terminated.
+    def msg_remove_domain(self, caller, domain_id):
+        """ New in R2: Remove a domain entirely.  All running instances of that domain will be terminated.
 
         @param caller Caller, if available
-        @param epu_name EPU name/ID
+        @param domain_id domain name/ID
         """
         if not self.initialized:
             raise Exception("Not initialized")
-        self.reactor.remove_epu(caller, epu_name)
+        self.reactor.remove_domain(caller, domain_id)
         # TODO: the engine API supports this via dying(), preserve_n is an internal thing (even though common)
 
-    def msg_reconfigure_epu(self, caller, epu_name, epu_config):
+    def msg_reconfigure_domain(self, caller, domain_id, config):
         """ From R1: op_reconfigure
 
         @param caller Caller, if available
-        @param epu_name EPU name/ID
-        @param epu_config New configuration
+        @param domain_id domain name/ID
+        @param config New configuration
 
-        ==========
-        EPU_CONFIG
-        ==========
+        =============
+        DOMAIN_CONFIG
+        =============
 
-        The expectations for the "epu_config" parameter follow.  This will cover both the initial
-        configuration (that is passed to add_epu) as well as any rules about reconfiguration of
-        an existing EPU.
+        The expectations for the "domain_config" parameter follow.  This will cover both the initial
+        configuration (that is passed to add_domain) as well as any rules about reconfiguration of
+        an existing domain.
 
-        What is an "EPU"?  It stands for "Elastic Processing Unit" and it is technically the VM
-        instances out there running that make up a logical group of entities doing "something"
-        together.
+        What is a Domain?  It is technically the VM instances out there running that make up a logical
+        group of entities doing "something" together.
 
-        To "reconfigure" an EPU is technically to change the configuration here in the EPUM service
-        (the EPU control plane) which may have ramifications on what a particular EPU's constituent
+        To "reconfigure" a domain is technically to change the configuration here in the EPUM service
+        (the control plane) which may have ramifications on what a particular domain's constituent
         parts end up being.
 
-        When we refer to an EPU vs. another EPU, in most systems the main distinguishing thing is
+        When we refer to a domain vs. another, in most systems the main distinguishing thing is
         the *type* of VM instances that are being launched.  A "deployable type" is a VM image that
         is launched with specific configuration values and 'recipes' to instantiate it.
 
@@ -257,7 +282,7 @@ class EPUManagement(object):
         clients using the same EPUM service to launch many applications across many IaaS clouds.
         TODO: This is not currently implemented.
 
-        An EPU's configuration is broken down into the following key sections:
+        A domain's configuration is broken down into the following key sections:
 
         * GENERAL
         * ENGINE CONF
@@ -324,7 +349,48 @@ class EPUManagement(object):
         """
         if not self.initialized:
             raise Exception("Not initialized")
-        self.reactor.reconfigure_epu(caller, epu_name, epu_config)
+        self.reactor.reconfigure_domain(caller, domain_id, config)
+
+    def msg_add_domain_definition(self, definition_id, definition):
+        """Add a new Domain Definition
+
+        @param definition_id domain definition name/ID
+        @param definition Domain definition of the domain
+        """
+        if not self.initialized:
+            raise Exception("Not initialized")
+        self.reactor.add_domain_definition(definition_id, definition)
+
+    def msg_remove_domain_definition(self, definition_id):
+        """ Remove a domain definition
+
+        @param definition_id domain definition name/ID
+        """
+        if not self.initialized:
+            raise Exception("Not initialized")
+        self.reactor.remove_domain_definition(definition_id)
+
+    def msg_describe_domain_definition(self, definition_id):
+        """Return a state structure for a domain definition, or None
+
+        @param definition_id domain definition name/ID
+        """
+        return self.reactor.describe_domain_definition(definition_id)
+
+    def msg_list_domain_definitions(self):
+        """Return a list of domain definitions in the system
+        """
+        return self.reactor.list_domain_definitions()
+
+    def msg_update_domain_definition(self, definition_id, definition):
+        """Update the domain definition with a new definition
+
+        @param definition_id domain definition name/ID
+        @param definition New domain definition of the domain
+        """
+        if not self.initialized:
+            raise Exception("Not initialized")
+        return self.reactor.update_domain_definition(definition_id, definition)
 
     def msg_heartbeat(self, caller, content, timestamp=None):
         """ From R1: op_heartbeat
@@ -342,11 +408,3 @@ class EPUManagement(object):
         if not self.initialized:
             raise Exception("Not initialized")
         return self.reactor.new_instance_state(content)
-
-    def msg_sensor_info(self, caller, content):
-        """ From R1: op_sensor_info
-        Reactor parses content.
-        """
-        if not self.initialized:
-            raise Exception("Not initialized")
-        return self.reactor.new_sensor_info(content)

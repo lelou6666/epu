@@ -1,10 +1,14 @@
+# Copyright 2013 University of Chicago
+
 import logging
 
 from dashi.util import LoopingCall
-from epu.epumanagement.conf import *
+from epu.epumanagement.conf import *  # noqa
 from epu.epumanagement.health import HealthMonitor, TESTCONF_HEALTH_INIT_TIME
+from epu.domain_log import EpuLoggerThreadSpecific
 
 log = logging.getLogger(__name__)
+
 
 class EPUMDoctor(object):
     """The doctor handles critical sections related to 'pronouncing' a VM instance unhealthy.
@@ -20,7 +24,7 @@ class EPUMDoctor(object):
     See: https://confluence.oceanobservatories.org/display/syseng/CIAD+CEI+OV+Elastic+Computing
     See: https://confluence.oceanobservatories.org/display/CIDev/EPUManagement+Refactor
     """
-    
+
     def __init__(self, epum_store, notifier, provisioner_client, epum_client,
                  ouagent_client, disable_loop=False):
         """
@@ -39,6 +43,7 @@ class EPUMDoctor(object):
 
         self.control_loop = None
         self.enable_loop = not disable_loop
+        self.is_leader = False
 
         # The instances of HealthMonitor that make the health decisions for each domain
         self.monitors = {}
@@ -49,10 +54,17 @@ class EPUMDoctor(object):
         # For callbacks: "now_leader()" and "not_leader()"
         self.epum_store.register_doctor(self)
 
-    def now_leader(self):
+    def now_leader(self, block=False):
         """Called when this instance becomes the doctor leader.
         """
+        log.info("Elected as Doctor leader")
         self._leader_initialize()
+        self.is_leader = True
+        if block:
+            if self.control_loop:
+                self.control_loop.thread.join()
+            else:
+                raise ValueError("cannot block without a control loop")
 
     def not_leader(self):
         """Called when this instance is known not to be the doctor leader.
@@ -60,6 +72,7 @@ class EPUMDoctor(object):
         if self.control_loop:
             self.control_loop.stop()
             self.control_loop = None
+        self.is_leader = False
 
     def _leader_initialize(self):
         """Performs initialization routines that may require async processing
@@ -76,17 +89,25 @@ class EPUMDoctor(object):
         Every time this runs, each domain's health monitor is loaded and
         """
         # Perhaps in the meantime, the leader connection failed, bail early
-        if not self.epum_store.currently_doctor():
+        if not self.is_leader:
             return
 
         domains = self.epum_store.get_all_domains()
         active_domains = {}
         for domain in domains:
+<<<<<<< HEAD
             if not domain.is_removed():
                 active_domains[domain.key] = domain
         
+=======
+            with EpuLoggerThreadSpecific(domain=domain.domain_id, user=domain.owner):
+
+                if not domain.is_removed():
+                    active_domains[domain.key] = domain
+
+>>>>>>> refs/remotes/nimbusproject/master
         # Perhaps in the meantime, the leader connection failed, bail early
-        if not self.epum_store.currently_doctor():
+        if not self.is_leader:
             return
 
         # Monitors that are not active anymore
@@ -96,19 +117,27 @@ class EPUMDoctor(object):
 
         # New health monitors (new to this doctor instance, at least)
         for domain_key in filter(lambda x: x not in self.monitors,
+<<<<<<< HEAD
             active_domains.iterkeys()):
             try:
                 self._new_monitor(active_domains[domain_key])
             except Exception,e:
+=======
+                active_domains.iterkeys()):
+            try:
+                self._new_monitor(active_domains[domain_key])
+            except Exception, e:
+>>>>>>> refs/remotes/nimbusproject/master
                 log.error("Error creating health monitor for '%s': %s",
                           domain_key, str(e), exc_info=True)
 
         for domain_key in self.monitors.keys():
             # Perhaps in the meantime, the leader connection failed, bail early
-            if not self.epum_store.currently_doctor():
+            if not self.is_leader:
                 return
             try:
                 self.monitors[domain_key].update(timestamp)
+<<<<<<< HEAD
             except Exception,e:
                 log.error("Error in doctor's update call for '%s': %s",
                           domain_key, str(e), exc_info=True)
@@ -129,4 +158,27 @@ class EPUMDoctor(object):
         if health_conf.has_key(TESTCONF_HEALTH_INIT_TIME):
             health_kwargs['init_time'] = health_conf[TESTCONF_HEALTH_INIT_TIME]
         self.monitors[domain.key] = HealthMonitor(domain, self.ouagent_client, **health_kwargs)
+=======
+            except Exception, e:
+                log.error("Error in doctor's update call for '%s': %s",
+                          domain_key, str(e), exc_info=True)
 
+    def _new_monitor(self, domain):
+        with EpuLoggerThreadSpecific(domain=domain.domain_id, user=domain.owner):
+>>>>>>> refs/remotes/nimbusproject/master
+
+            if not domain.is_health_enabled():
+                return
+            health_conf = domain.get_health_config()
+            health_kwargs = {}
+            if EPUM_CONF_HEALTH_BOOT in health_conf:
+                health_kwargs['boot_seconds'] = health_conf[EPUM_CONF_HEALTH_BOOT]
+            if EPUM_CONF_HEALTH_MISSING in health_conf:
+                health_kwargs['missing_seconds'] = health_conf[EPUM_CONF_HEALTH_MISSING]
+            if EPUM_CONF_HEALTH_REALLY_MISSING in health_conf:
+                health_kwargs['really_missing_seconds'] = health_conf[EPUM_CONF_HEALTH_REALLY_MISSING]
+            if EPUM_CONF_HEALTH_ZOMBIE in health_conf:
+                health_kwargs['zombie_seconds'] = health_conf[EPUM_CONF_HEALTH_ZOMBIE]
+            if TESTCONF_HEALTH_INIT_TIME in health_conf:
+                health_kwargs['init_time'] = health_conf[TESTCONF_HEALTH_INIT_TIME]
+            self.monitors[domain.key] = HealthMonitor(domain, self.ouagent_client, **health_kwargs)
