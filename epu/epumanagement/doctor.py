@@ -1,10 +1,14 @@
+# Copyright 2013 University of Chicago
+
 import logging
 
 from dashi.util import LoopingCall
-from epu.epumanagement.conf import *
+from epu.epumanagement.conf import *  # noqa
 from epu.epumanagement.health import HealthMonitor, TESTCONF_HEALTH_INIT_TIME
+from epu.domain_log import EpuLoggerThreadSpecific
 
 log = logging.getLogger(__name__)
+
 
 class EPUMDoctor(object):
     """The doctor handles critical sections related to 'pronouncing' a VM instance unhealthy.
@@ -20,7 +24,7 @@ class EPUMDoctor(object):
     See: https://confluence.oceanobservatories.org/display/syseng/CIAD+CEI+OV+Elastic+Computing
     See: https://confluence.oceanobservatories.org/display/CIDev/EPUManagement+Refactor
     """
-    
+
     def __init__(self, epum_store, notifier, provisioner_client, epum_client,
                  ouagent_client, disable_loop=False):
         """
@@ -39,16 +43,10 @@ class EPUMDoctor(object):
 
         self.control_loop = None
         self.enable_loop = not disable_loop
+        self.is_leader = False
 
-        # The instances of HealthMonitor that make the health decisions for each EPU
+        # The instances of HealthMonitor that make the health decisions for each domain
         self.monitors = {}
-
-        # TODO (DGL) not replicating this semaphore behavior from twisted now
-        #   as it doesn't seem to matter
-
-        # There can only ever be one health call run at ANY time.  This could be expanded to be
-        # a latch per EPU for better concurrency, but keeping it simple, especially for prototype.
-        #self.busy = defer.DeferredSemaphore(1)
 
     def recover(self):
         """Called whenever the whole EPUManagement instance is instantiated.
@@ -56,10 +54,17 @@ class EPUMDoctor(object):
         # For callbacks: "now_leader()" and "not_leader()"
         self.epum_store.register_doctor(self)
 
-    def now_leader(self):
+    def now_leader(self, block=False):
         """Called when this instance becomes the doctor leader.
         """
+        log.info("Elected as Doctor leader")
         self._leader_initialize()
+        self.is_leader = True
+        if block:
+            if self.control_loop:
+                self.control_loop.thread.join()
+            else:
+                raise ValueError("cannot block without a control loop")
 
     def not_leader(self):
         """Called when this instance is known not to be the doctor leader.
@@ -67,6 +72,7 @@ class EPUMDoctor(object):
         if self.control_loop:
             self.control_loop.stop()
             self.control_loop = None
+        self.is_leader = False
 
     def _leader_initialize(self):
         """Performs initialization routines that may require async processing
@@ -80,64 +86,63 @@ class EPUMDoctor(object):
         """
         Run the doctor decider loop.
 
-        Every time this runs, each EPU's health monitor is loaded and
+        Every time this runs, each domain's health monitor is loaded and
         """
         # Perhaps in the meantime, the leader connection failed, bail early
-        if not self.epum_store.currently_doctor():
+        if not self.is_leader:
             return
 
-        epus = self.epum_store.all_active_epus()
-        for epu_name in epus.keys():
-            epus[epu_name].recover()
-        
+        domains = self.epum_store.get_all_domains()
+        active_domains = {}
+        for domain in domains:
+            with EpuLoggerThreadSpecific(domain=domain.domain_id, user=domain.owner):
+
+                if not domain.is_removed():
+                    active_domains[domain.key] = domain
+
         # Perhaps in the meantime, the leader connection failed, bail early
-        if not self.epum_store.currently_doctor():
+        if not self.is_leader:
             return
 
         # Monitors that are not active anymore
-        for epu_name in self.monitors.keys():
-            if epu_name not in epus.keys():
-                del self.monitors[epu_name]
+        for key in self.monitors.keys():
+            if key not in active_domains:
+                del self.monitors[key]
 
         # New health monitors (new to this doctor instance, at least)
-        for new_epu_name in filter(lambda x: x not in self.monitors.keys(), epus.keys()):
+        for domain_key in filter(lambda x: x not in self.monitors,
+                active_domains.iterkeys()):
             try:
-                self._new_monitor(new_epu_name)
-            except Exception,e:
+                self._new_monitor(active_domains[domain_key])
+            except Exception, e:
                 log.error("Error creating health monitor for '%s': %s",
-                          new_epu_name, str(e), exc_info=True)
+                          domain_key, str(e), exc_info=True)
 
-        for epu_name in self.monitors.keys():
+        for domain_key in self.monitors.keys():
             # Perhaps in the meantime, the leader connection failed, bail early
-            if not self.epum_store.currently_doctor():
+            if not self.is_leader:
                 return
             try:
-
-                #NOTE (DGL) Under twisted this was wrapped in a DeferredSemaphore
-                # to ensure only one call could be active at a time. I haven't seen
-                # any reason for this as this is the only entry point to the semaphore.
-                # Leaving it out for now.
-
-                self.monitors[epu_name].update(timestamp)
-            except Exception,e:
+                self.monitors[domain_key].update(timestamp)
+            except Exception, e:
                 log.error("Error in doctor's update call for '%s': %s",
-                          epu_name, str(e), exc_info=True)
-    
-    def _new_monitor(self, epu_name):
-        epu_state = self.epum_store.get_epu_state(epu_name)
-        if not epu_state.is_health_enabled():
-            return
-        health_conf = epu_state.get_health_conf()
-        health_kwargs = {}
-        if health_conf.has_key(EPUM_CONF_HEALTH_BOOT):
-            health_kwargs['boot_seconds'] = health_conf[EPUM_CONF_HEALTH_BOOT]
-        if health_conf.has_key(EPUM_CONF_HEALTH_MISSING):
-            health_kwargs['missing_seconds'] = health_conf[EPUM_CONF_HEALTH_MISSING]
-        if health_conf.has_key(EPUM_CONF_HEALTH_REALLY_MISSING):
-            health_kwargs['really_missing_seconds'] = health_conf[EPUM_CONF_HEALTH_REALLY_MISSING]
-        if health_conf.has_key(EPUM_CONF_HEALTH_ZOMBIE):
-            health_kwargs['zombie_seconds'] = health_conf[EPUM_CONF_HEALTH_ZOMBIE]
-        if health_conf.has_key(TESTCONF_HEALTH_INIT_TIME):
-            health_kwargs['init_time'] = health_conf[TESTCONF_HEALTH_INIT_TIME]
-        self.monitors[epu_name] = HealthMonitor(epu_state, self.ouagent_client, **health_kwargs)
+                          domain_key, str(e), exc_info=True)
 
+    def _new_monitor(self, domain):
+        with EpuLoggerThreadSpecific(domain=domain.domain_id, user=domain.owner):
+
+            if not domain.is_health_enabled():
+                return
+            health_conf = domain.get_health_config()
+            health_kwargs = {}
+            if EPUM_CONF_HEALTH_BOOT in health_conf:
+                health_kwargs['boot_seconds'] = health_conf[EPUM_CONF_HEALTH_BOOT]
+            if EPUM_CONF_HEALTH_MISSING in health_conf:
+                health_kwargs['missing_seconds'] = health_conf[EPUM_CONF_HEALTH_MISSING]
+            if EPUM_CONF_HEALTH_REALLY_MISSING in health_conf:
+                health_kwargs['really_missing_seconds'] = health_conf[EPUM_CONF_HEALTH_REALLY_MISSING]
+            if EPUM_CONF_HEALTH_ZOMBIE in health_conf:
+                health_kwargs['zombie_seconds'] = health_conf[EPUM_CONF_HEALTH_ZOMBIE]
+            if TESTCONF_HEALTH_INIT_TIME in health_conf:
+                health_kwargs['init_time'] = health_conf[TESTCONF_HEALTH_INIT_TIME]
+            self.monitors[domain.key] = HealthMonitor(domain, self.ouagent_client, **health_kwargs)

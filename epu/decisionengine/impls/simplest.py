@@ -10,6 +10,7 @@ BAD_STATES = [InstanceState.TERMINATING, InstanceState.TERMINATED, InstanceState
 
 CONF_PRESERVE_N = "preserve_n"
 
+
 class SimplestEngine(Engine):
     """A decision engine that maintains N instances of the compensating units.
     It's Npreserving policy (only) can be reconfigured.
@@ -40,17 +41,17 @@ class SimplestEngine(Engine):
         """
         if not conf:
             raise ValueError("requires engine conf")
-        
-        if conf.has_key("force_site"):
+
+        if "force_site" in conf:
             self.available_sites = [conf["force_site"]]
 
-        if conf.has_key("epuworker_type"):
+        if "epuworker_type" in conf:
             self.available_types = [conf["epuworker_type"]]
 
-        if conf.has_key("epuworker_allocation"):
+        if "epuworker_allocation" in conf:
             self.available_allocations = [conf["epuworker_allocation"]]
 
-        if conf.has_key(CONF_PRESERVE_N):
+        if CONF_PRESERVE_N in conf:
             self.preserve_n = int(conf[CONF_PRESERVE_N])
             if self.preserve_n < 0:
                 raise ValueError("cannot have negative %s conf: %d" % (CONF_PRESERVE_N, self.preserve_n))
@@ -78,8 +79,8 @@ class SimplestEngine(Engine):
         """
         all_instances = state.instances.values()
         valid_set = set(i.instance_id for i in all_instances if not i.state in BAD_STATES)
-        
-        #check all nodes to see if some are unhealthy, and terminate them
+
+        # check all nodes to see if some are unhealthy, and terminate them
         for instance in state.get_unhealthy_instances():
             log.warn("Terminating unhealthy node: %s", instance.instance_id)
             self._destroy_one(control, instance.instance_id)
@@ -101,7 +102,7 @@ class SimplestEngine(Engine):
         elif valid_count > self.preserve_n:
             log.debug("valid count (%d) > target (%d)" % (valid_count, self.preserve_n))
             while valid_count > self.preserve_n:
-                die_id = random.sample(valid_set, 1)[0] # len(valid_set) is always > 0 here
+                die_id = random.sample(valid_set, 1)[0]  # len(valid_set) is always > 0 here
                 self._destroy_one(control, die_id)
                 valid_set.discard(die_id)
                 valid_count -= 1
@@ -110,7 +111,7 @@ class SimplestEngine(Engine):
             self._set_state_pending()
         else:
             self._set_state(all_instances, -1, health_not_checked=control.health_not_checked)
-            
+
     def _launch_one(self, control, uniquekv=None):
         launch_id, instance_ids = control.launch(self.available_types[0],
             self.available_sites[0], self.available_allocations[0],
@@ -122,7 +123,7 @@ class SimplestEngine(Engine):
     def _destroy_one(self, control, instanceid):
         control.destroy_instances([instanceid])
         log.info("Destroyed an instance ('%s')" % instanceid)
-        
+
     def reconfigure(self, control, newconf):
         """
         Give the engine a new configuration.
@@ -139,8 +140,46 @@ class SimplestEngine(Engine):
         if not newconf:
             raise ValueError("expected new engine conf")
         log.debug("engine reconfigure, newconf: %s" % newconf)
-        if newconf.has_key(CONF_PRESERVE_N):
+        if CONF_PRESERVE_N in newconf:
             new_n = int(newconf[CONF_PRESERVE_N])
             if new_n < 0:
                 raise ValueError("cannot have negative %s conf: %d" % (CONF_PRESERVE_N, new_n))
             self.preserve_n = new_n
+
+    @classmethod
+    def validate_config(cls, conf):
+        if not conf:
+            raise ValueError("requires engine conf")
+
+        valid_keys = ["force_site", "epuworker_type", "epuworker_allocation", CONF_PRESERVE_N]
+
+        for key in conf.keys():
+            if key not in valid_keys:
+                raise ValueError("key %s in conf is not accepted by engine" % key)
+
+            if CONF_PRESERVE_N in conf:
+                try:
+                    preserve_n = int(conf[CONF_PRESERVE_N])
+                except ValueError:
+                    raise ValueError("%s conf must be a base-10 integer" % CONF_PRESERVE_N)
+
+                if preserve_n < 0:
+                    raise ValueError("cannot have negative %s conf: %d" % (CONF_PRESERVE_N, preserve_n))
+            else:
+                raise ValueError("requires %s conf" % CONF_PRESERVE_N)
+
+    @classmethod
+    def get_config_doc(cls):
+        config_doc = """
+Required config:
+
+- %s: Number of instances to run continuously in the domain
+
+Optional config:
+
+- force_site: IaaS site to use (defaults to ec2-east)
+- epuworker_type: DT to provision (defaults to epu_work_consumer)
+- epuworker_allocation: IaaS allocation to use (defaults to small)
+""" % CONF_PRESERVE_N
+
+        return cls.__doc__ + config_doc
