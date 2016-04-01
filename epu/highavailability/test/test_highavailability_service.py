@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import os
 import yaml
 import unittest
@@ -102,7 +104,8 @@ class HighAvailabilityServiceMixin(unittest.TestCase):
             except:
                 break
 
-        assert self.haservice.core.policy_params == new_params, "%s != %s" % (self.haservice.core.policy_params, new_params)
+        assert self.haservice.core.policy.parameters == new_params, "%s != %s" % (
+            self.haservice.core.policy.parameters, new_params)
 
     def _find_procs_pd(self, upid):
         all_procs = self._get_all_procs()
@@ -143,16 +146,21 @@ class HighAvailabilityServiceMixin(unittest.TestCase):
 
     def _assert_n_processes(self, n, timeout=None, only_pd=None):
         if not timeout:
-            # HA service works every 5s, so should take no longer than 30s
-            timeout = 30
+            # HA service works every 5s, so should take no longer than 60s
+            timeout = 120
         processes = None
         for i in range(0, timeout):
             processes = self.haservice.core.managed_upids
-            print "Procs: %s" % processes
+            all_procs = self.haservice.control.get_all_processes()
+
+            msg = "Managed procs: "
+            for upid in processes:
+                proc = self._get_proc_from_all_pds(upid)
+                msg += "%s is %s," % (upid, proc['state'])
+            print msg
+
             if n == 0 and len(processes) == n:
                 # Check to make sure nothing running, or at least all marked terminated
-                all_procs = self.haservice.core._query_process_dispatchers()
-                print all_procs
                 proc_list = []
                 for pd_name, procs in all_procs.iteritems():
                     proc_list += procs
@@ -161,8 +169,7 @@ class HighAvailabilityServiceMixin(unittest.TestCase):
                     return
                 else:
                     for proc in procs:
-                        msg = "expected %s to be terminated but is %s" % (
-                                proc['upid'], proc['state'])
+                        msg = "expected %s to be terminated but is %s" % (proc['upid'], proc['state'])
                         assert proc['state'] in ('600-TERMINATING', '700-TERMINATED', '800-EXITED'), msg
                     return
 
@@ -200,28 +207,30 @@ class HighAvailabilityServiceTests(HighAvailabilityServiceMixin, TestFixture):
         if not os.environ.get("INT"):
             raise SkipTest("Skipping Slow integration test")
         self.exchange = "hatestexchange-%s" % str(uuid.uuid4())
+        self.sysname = "test-%s" % str(uuid.uuid4())
 
         parsed_deployment = yaml.load(deployment)
         self.pd_names = parsed_deployment['process-dispatchers'].keys()
         policy_params = {'preserve_n': 0}
-        self.process_spec = {
-                'run_type': 'supd',
-                'executable': {
-                    'exec': 'sleep',
-                    'argv': ['1000']
-                    }
-                }
+        executable = {'exec': 'sleep', 'argv': ['1000']}
 
-        self.setup_harness(exchange=self.exchange)
+        print "ST: sysname %s" % self.sysname
+        self.setup_harness(exchange=self.exchange, sysname=self.sysname)
         self.addCleanup(self.cleanup_harness)
 
         self.epuharness.start(deployment_str=deployment)
 
         self.block_until_ready(deployment, self.dashi)
 
+        self.process_definition_id = uuid.uuid4().hex
+        for pd_name in self.pd_names:
+            pd_client = ProcessDispatcherClient(self.dashi, pd_name,)
+            pd_client.create_definition(self.process_definition_id, None,
+                executable, None, None)
+
         self.haservice = HighAvailabilityService(policy_parameters=policy_params,
                 process_dispatchers=self.pd_names, exchange=self.exchange,
-                process_spec=self.process_spec)
+                process_definition_id=self.process_definition_id, sysname=self.sysname)
         self.haservice_thread = tevent.spawn(self.haservice.start)
 
         self.dashi = self.haservice.dashi
@@ -338,6 +347,7 @@ class HighAvailabilityServiceOnePDTests(HighAvailabilityServiceMixin, TestFixtur
         if not os.environ.get("INT"):
             raise SkipTest("Skipping Slow integration test")
         self.exchange = "hatestexchange-%s" % str(uuid.uuid4())
+        self.sysname = "test-%s" % str(uuid.uuid4())
 
         parsed_deployment = yaml.load(deployment_one_pd_two_eea)
         self.pd_names = parsed_deployment['process-dispatchers'].keys()
@@ -346,23 +356,24 @@ class HighAvailabilityServiceOnePDTests(HighAvailabilityServiceMixin, TestFixtur
             for eeagent in node['eeagents'].keys():
                 self.eea_names.append(eeagent)
         policy_params = {'preserve_n': 0}
-        self.process_spec = {
-                'run_type': 'supd',
-                'executable': {
-                    'exec': 'sleep',
-                    'argv': ['1000']
-                    }
-                }
+        executable = {'exec': 'sleep', 'argv': ['1000']}
 
-        self.setup_harness(exchange=self.exchange)
+        self.setup_harness(exchange=self.exchange, sysname=self.sysname)
         self.addCleanup(self.cleanup_harness)
 
         self.epuharness.start(deployment_str=deployment_one_pd_two_eea)
         self.block_until_ready(deployment_one_pd_two_eea, self.dashi)
 
+        self.process_definition_id = uuid.uuid4().hex
+        for pd_name in self.pd_names:
+            pd_client = ProcessDispatcherClient(self.dashi, pd_name)
+            pd_client.create_definition(self.process_definition_id, None,
+                executable, None, None)
+
         self.haservice = HighAvailabilityService(policy_parameters=policy_params,
                 process_dispatchers=self.pd_names, exchange=self.exchange,
-                process_spec=self.process_spec)
+                process_definition_id=self.process_definition_id,
+                sysname=self.sysname)
         self.haservice_thread = tevent.spawn(self.haservice.start)
 
         self.dashi = self.haservice.dashi
@@ -379,7 +390,7 @@ class HighAvailabilityServiceOnePDTests(HighAvailabilityServiceMixin, TestFixtur
         The Process Dispatcher should manage this scenario, so HA shouldn't
         do anything
         """
-        #raise SkipTest("Processes aren't running on EEAs")
+        # raise SkipTest("Processes aren't running on EEAs")
 
         n = 2
         self._update_policy_params_and_assert({'preserve_n': n})

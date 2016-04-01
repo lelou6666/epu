@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 import logging
 
 from epu.epumanagement.reactor import EPUMReactor
@@ -6,11 +8,13 @@ from epu.epumanagement.decider import EPUMDecider
 from epu.epumanagement.reaper import EPUMReaper
 from epu.epumanagement.core import DomainSubscribers
 from epu.epumanagement.conf import EPUM_INITIALCONF_EXTERNAL_DECIDE,\
-    CONF_IAAS_SITE, EPUM_INITIALCONF_DEFAULT_NEEDY_IAAS,\
-    EPUM_INITIALCONF_DEFAULT_NEEDY_IAAS_ALLOC, CONF_IAAS_ALLOCATION,\
-    PROVISIONER_VARS_KEY, EPUM_RECORD_REAPING_DEFAULT_MAX_AGE
+    EPUM_INITIALCONF_DEFAULT_NEEDY_IAAS,\
+    EPUM_INITIALCONF_DEFAULT_NEEDY_IAAS_ALLOC,\
+    PROVISIONER_VARS_KEY, EPUM_RECORD_REAPING_DEFAULT_MAX_AGE,\
+    EPUM_CONF_DECIDER_LOOP_INTERVAL, EPUM_DECIDER_DEFAULT_LOOP_INTERVAL
 
 log = logging.getLogger(__name__)
+
 
 class EPUManagement(object):
     """
@@ -22,8 +26,8 @@ class EPUManagement(object):
     in test/dev situations to bypass the messaging layer altogether.
     """
 
-    def __init__(self, initial_conf, notifier, provisioner_client,
-                 ouagent_client, dtrs_client, epum_client=None, store=None):
+    def __init__(self, initial_conf, notifier, provisioner_client, ouagent_client, dtrs_client, epum_client=None,
+                 store=None, statsd_cfg=None):
         """Given a configuration, instantiate all EPUM roles and objects
 
         INITIAL_CONF dict:
@@ -44,6 +48,7 @@ class EPUManagement(object):
         @param dtrs_client DTRSClient
         @param epum_client EPUManagement client (See clients.py). If None, uses self (in-memory).
         @param store EPUMStore implementation, or None
+        @param statsd_cfg statsd configuration dict, or None
         """
 
         self.initialized = False
@@ -81,14 +86,16 @@ class EPUManagement(object):
         # might not be configured to receive messages.  But when it is receiving messages, they all go
         # to the EPUMReactor instance.
         self.reactor = EPUMReactor(self.epum_store, self.domain_subscribers, provisioner_client, epum_client)
-        
+
         # The instance of the EPUManagementService process that hosts a particular EPUMDecider instance
         # might not be the elected decider.  When it is the elected decider, its EPUMDecider instance
         # handles that functionality.  When it is not the elected decider, its EPUMDecider instance
         # handles being available in the election.
-        self.decider = EPUMDecider(self.epum_store, self.domain_subscribers,
-            provisioner_client, epum_client, dtrs_client, disable_loop=self._external_decide_mode,
-            base_provisioner_vars=base_provisioner_vars)
+        decider_loop_interval = initial_conf.get(EPUM_CONF_DECIDER_LOOP_INTERVAL,
+            EPUM_DECIDER_DEFAULT_LOOP_INTERVAL)
+        self.decider = EPUMDecider(self.epum_store, self.domain_subscribers, provisioner_client, epum_client,
+                dtrs_client, disable_loop=self._external_decide_mode, base_provisioner_vars=base_provisioner_vars,
+                loop_interval=decider_loop_interval, statsd_cfg=statsd_cfg)
 
         # The instance of the EPUManagementService process that hosts a particular EPUMDoctor instance
         # might not be the elected leader.  When it is the elected leader, this EPUMDoctor handles that
@@ -106,7 +113,6 @@ class EPUManagement(object):
                                                   EPUM_RECORD_REAPING_DEFAULT_MAX_AGE)
         self.reaper = EPUMReaper(self.epum_store, record_reaping_max_age,
                                  disable_loop=self._external_decide_mode)
-
 
     def initialize(self):
         """
@@ -367,11 +373,3 @@ class EPUManagement(object):
         if not self.initialized:
             raise Exception("Not initialized")
         return self.reactor.new_instance_state(content)
-
-    def msg_sensor_info(self, caller, content):
-        """ From R1: op_sensor_info
-        Reactor parses content.
-        """
-        if not self.initialized:
-            raise Exception("Not initialized")
-        return self.reactor.new_sensor_info(content)

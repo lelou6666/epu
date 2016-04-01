@@ -1,39 +1,41 @@
+# Copyright 2013 University of Chicago
+
 class Control(object):
     """
     This is the superclass for any implementation of the control object that
     is passed to the decision engine.  The control object is a way for the
     engine to make requests to the EPU Controller, like to send launch
     requests to the Provisioner.
-    
-    The abc (abstract base class) module is not present in Python 2.5 but 
+
+    The abc (abstract base class) module is not present in Python 2.5 but
     Control should be treated as such.  It is not meant to be instantiated
     directly.
-    
+
     """
-    
+
     def __init__(self):
         pass
-    
+
     def configure(self, parameters):
         """
         Give the engine the opportunity to offer input about how often it
         should be called or what specific events it would always like to be
         triggered after.
-        
+
         See the decision engine implementer's guide for specific configuration
         options.
-        
+
         @retval None
         @exception Exception illegal/unrecognized input
-        
+
         """
         raise NotImplementedError
-    
+
     def launch(self, deployable_type_id, site, allocation, count=1, extravars=None, caller=None):
         """
         Choose instance IDs for each instance desired, a launch ID and send
         appropriate message to Provisioner.
-        
+
         @param deployable_type_id string identifier of the DT to launch
         @param site IaaS site to launch on
         @param allocation IaaS allocation (size) to request
@@ -42,50 +44,21 @@ class Control(object):
         @retval tuple (launch_id, instance_ids), see guide
         @exception Exception illegal input
         @exception Exception message not sent
-        
+
         """
         raise NotImplementedError
-    
+
     def destroy_instances(self, instance_list):
         """
         Terminate particular instances.
-        
+
         @param instance_list list size >0 of instance IDs to terminate
         @retval None
         @exception Exception illegal input/unknown ID(s)
         @exception Exception message not sent
-        
+
         """
         raise NotImplementedError
-    
-    def destroy_launch(self, launch_id):
-        """
-        Terminate an entire launch.
-        
-        @param launch_id launch to terminate
-        @retval None
-        @exception Exception illegal input/unknown ID
-        @exception Exception message not sent
-        
-        """
-        raise NotImplementedError
-
-
-class SensorItem(object):
-    """
-    One data reading that the EPU Controller knows about.
-    It has simple Python attributes (no property decorators).
-    
-    """
-    def __init__(self, sensor_id, time, value):
-        """
-        @param key unique identifier, depends on the type
-        @param time integer,  unixtime data was obtained by EPU Controller
-        @param value arbitrary object
-        """
-        self.sensor_id = str(sensor_id)
-        self.time = long(time)
-        self.value = value
 
 
 class Instance(object):

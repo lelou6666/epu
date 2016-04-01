@@ -1,6 +1,25 @@
+# Copyright 2013 University of Chicago
+
 import os
 import sys
+import string
+import numbers
+from datetime import timedelta
+
+from epu import rfc3339
+
 from epu.exceptions import UserNotPermittedError
+
+
+# .-_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+_VALID = ".-_%s%s" % (string.ascii_letters, string.digits)
+_VALID_SET = frozenset(_VALID)
+
+
+def is_valid_identifier(ident):
+    if not (isinstance(ident, basestring) and ident):
+        return False
+    return set(ident) <= _VALID_SET
 
 
 def get_class(kls):
@@ -10,7 +29,7 @@ def get_class(kls):
     if parts < 2:
         raise ValueError("expecting module and class separated by .")
     module = ".".join(parts[:-1])
-    m = __import__( module )
+    m = __import__(module)
     for comp in parts[1:]:
         m = getattr(m, comp)
     return m
@@ -29,6 +48,7 @@ def determine_path():
         print "I'm sorry, but something is wrong."
         print "There is no __file__ variable. Please contact the author."
         sys.exit()
+
 
 def get_config_paths(configs):
     """converts a list of config file names to a list of absolute paths
@@ -56,7 +76,10 @@ def get_config_paths(configs):
 
     return paths
 
+
 unspecified = object()
+
+
 def check_user(caller=unspecified, creator=unspecified, operation=None):
 
     if caller is unspecified and creator is unspecified:
@@ -71,6 +94,37 @@ def check_user(caller=unspecified, creator=unspecified, operation=None):
 
     if caller != creator:
         msg = "%s not permitted, creator is %s and caller is %s" % (
-           operation, creator, caller)
+            operation, creator, caller)
         raise UserNotPermittedError(msg)
 
+
+UTC = rfc3339.UTC_TZ
+
+
+def now_datetime():
+    return rfc3339.now()
+
+
+def parse_datetime(s):
+    """Parse a string into a datetime object
+    """
+    return rfc3339.parse_datetime(s)
+
+
+def ceiling_datetime(d, now=None):
+    if now is None:
+        now = rfc3339.now()
+
+    if d > now:
+        return now
+    return d
+
+
+def ensure_timedelta(t):
+    if isinstance(t, timedelta):
+        return t
+
+    if isinstance(t, numbers.Real):
+        return timedelta(seconds=t)
+
+    raise TypeError("cannot convert %s to timedelta" % (t,))

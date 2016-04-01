@@ -1,3 +1,5 @@
+# Copyright 2013 University of Chicago
+
 
 import os
 import tempfile
@@ -11,14 +13,15 @@ class TestMockLibCloud(object):
 
     def setup(self):
         try:
-            import sqlalchemy
+            import sqlalchemy  # noqa
         except ImportError:
             raise SkipTest("SQLAlchemy not available.")
 
         from epu.mocklibcloud import MockEC2NodeDriver
         fh, self.sqlite_db_file = tempfile.mkstemp()
         os.close(fh)
-        self.libcloud = MockEC2NodeDriver(sqlite_db=self.sqlite_db_file)
+        self.libcloud = MockEC2NodeDriver(sqlite_db=self.sqlite_db_file,
+            operation_time=0.01)
 
     def teardown(self):
         try:
@@ -46,7 +49,7 @@ class TestMockLibCloud(object):
         assert len(nodes) == 1
         assert nodes[0].state == NodeState.TERMINATED
 
-        #Ensure VMs come up broken
+        # Ensure VMs come up broken
         self.libcloud._fail_to_start = True
         got_node = self.libcloud.create_node(name=name)
         assert got_node.name == name
@@ -112,9 +115,12 @@ def _parallel_worker(sqlite_db, client_token, create_count):
 class TestMockLibCloudParallel(object):
     def setUp(self):
         try:
-            import sqlalchemy
+            import sqlalchemy  # noqa
         except ImportError:
             raise SkipTest("SQLAlchemy not available.")
+
+        if os.environ.get("JENKINS_URL") is not None:
+            raise SkipTest("This test does not work on Jenkins")
 
         from epu.mocklibcloud import MockEC2NodeDriver
         fh, self.sqlite_db_file = tempfile.mkstemp()

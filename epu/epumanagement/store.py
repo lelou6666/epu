@@ -1,6 +1,8 @@
+# Copyright 2013 University of Chicago
+
 import logging
 import time
-import json
+import simplejson as json
 import threading
 import re
 import socket
@@ -11,11 +13,11 @@ from kazoo.exceptions import NodeExistsException, BadVersionException,\
     NoNodeException
 
 import epu.tevent as tevent
-from epu.epumanagement.core import EngineState, SensorItemParser, InstanceParser, CoreInstance
+from epu.epumanagement.core import EngineState, InstanceParser, CoreInstance
 from epu.states import InstanceState, InstanceHealthState
 from epu.exceptions import NotFoundError, WriteConflictError
 from epu import zkutil
-from epu.epumanagement.conf import *
+from epu.epumanagement.conf import *  # noqa
 
 
 log = logging.getLogger(__name__)
@@ -31,7 +33,7 @@ def get_epum_store(config, service_name, use_gevent=False, proc_name=None):
 
         store = ZooKeeperEPUMStore(service_name, zookeeper['hosts'],
             zookeeper['path'], username=zookeeper.get('username'),
-            password=zookeeper.get('password'),
+            password=zookeeper.get('password'), use_gevent=use_gevent,
             timeout=zookeeper.get('timeout'), proc_name=proc_name)
 
     else:
@@ -164,7 +166,6 @@ class DomainStore(object):
 
     def __init__(self, owner, domain_id):
         self.instance_parser = InstanceParser()
-        self.sensor_parser = SensorItemParser()
         self.owner = owner
         self.domain_id = domain_id
 
@@ -204,6 +205,25 @@ class DomainStore(object):
         @param conf dictionary mapping strings to JSON-serializable objects
         """
 
+    def add_domain_sensor_data(self, sensor_data):
+        """Store a dictionary of domain sensor data.
+
+        This operation replaces previous sensor data
+
+        data is in the format:
+        {
+          'metric':{
+            'Average': 5
+          }
+        }
+
+        @param sensor_data dictionary mapping strings to JSON-serializable objects
+        """
+
+    def get_domain_sensor_data(self):
+        """Retrieve a dictionary of sensor data from the store
+        """
+
     def get_health_config(self, keys=None):
         """Retrieve the health config dictionary.
 
@@ -225,7 +245,7 @@ class DomainStore(object):
         """Return True if the EPUM_CONF_HEALTH_MONITOR setting is True
         """
         health_conf = self.get_health_config()
-        if not health_conf.has_key(EPUM_CONF_HEALTH_MONITOR):
+        if EPUM_CONF_HEALTH_MONITOR not in health_conf:
             return False
         else:
             return bool(health_conf[EPUM_CONF_HEALTH_MONITOR])
@@ -311,6 +331,8 @@ class DomainStore(object):
 
     def new_instance_state(self, content, timestamp=None, previous=None):
         """Introduce a new instance state from an incoming message
+
+        returns True/False indicating whether instance state was accepted
         """
         instance_id = self.instance_parser.parse_instance_id(content)
         if instance_id:
@@ -320,6 +342,30 @@ class DomainStore(object):
                                                   timestamp=timestamp)
             if instance:
                 self.update_instance(instance, previous=previous)
+                return True
+            # instance was probably a duplicate
+            return False
+        return False
+
+    def mark_instance_terminating(self, instance_id):
+        """Mark an instance for termination
+
+        returns True/False indicating where instance was updated
+        """
+        while 1:
+            instance = self.get_instance(instance_id)
+            if not instance or instance.state >= InstanceState.TERMINATING:
+                return False
+
+            d = dict(instance.iteritems())
+            d['state'] = InstanceState.TERMINATING
+            newinstance = CoreInstance(**d)
+
+            try:
+                self.update_instance(newinstance, previous=instance)
+                return True
+            except WriteConflictError:
+                pass
 
     def new_instance_launch(self, deployable_type_id, instance_id, launch_id, site, allocation,
                             extravars=None, timestamp=None):
@@ -342,6 +388,7 @@ class DomainStore(object):
                             deployable_type=deployable_type_id,
                             extravars=extravars)
         self.add_instance(instance)
+        return instance
 
     def new_instance_health(self, instance_id, health_state, error_time=None, errors=None, caller=None):
         """Record instance health change
@@ -366,7 +413,7 @@ class DomainStore(object):
         d['caller'] = caller
 
         if errors:
-            log.error("Got error heartbeat from instance %s. State: %s. "+
+            log.error("Got error heartbeat from instance %s. State: %s. " +
                       "Health: %s. Errors: %s", instance_id, instance.state,
                       health_state, errors)
 
@@ -401,6 +448,17 @@ class DomainStore(object):
 
         newinstance = CoreInstance(**d)
         self.update_instance(newinstance, previous=instance)
+
+    def new_domain_sensor(self, sensor_data):
+        """Record domain sensor change
+
+        @param sensor_data The state
+        """
+
+        log.info("Domain %s got sensor data %s", self.domain_id, sensor_data)
+
+        previous_sensor_data = self.get_sensor_data()
+        self.update_sensor_data(sensor_data, previous=previous_sensor_data)
 
     def ouagent_address(self, instance_id):
         """Return address to send messages to a particular OU Agent, or None"""
@@ -447,6 +505,9 @@ class LocalEPUMStore(EPUMStore):
         self.local_reaper_ref = None
 
     def initialize(self):
+        pass
+
+    def shutdown(self):
         pass
 
     def _change_decider(self, make_leader):
@@ -648,13 +709,13 @@ class LocalDomainStore(DomainStore):
         self.health_config = {}
         self.general_config = {}
         if config:
-            if config.has_key(EPUM_CONF_GENERAL):
+            if EPUM_CONF_GENERAL in config:
                 self.add_general_config(config[EPUM_CONF_GENERAL])
 
-            if config.has_key(EPUM_CONF_ENGINE):
+            if EPUM_CONF_ENGINE in config:
                 self.add_engine_config(config[EPUM_CONF_ENGINE])
 
-            if config.has_key(EPUM_CONF_HEALTH):
+            if EPUM_CONF_HEALTH in config:
                 self.add_health_config(config[EPUM_CONF_HEALTH])
         self.engine_state = EngineState()
 
@@ -663,6 +724,7 @@ class LocalDomainStore(DomainStore):
         self.instances = {}
         self.instance_heartbeats = {}
 
+        self.domain_sensor_data = {}
 
     def is_removed(self):
         """Whether this domain has been marked for removal
@@ -682,7 +744,7 @@ class LocalDomainStore(DomainStore):
         """
 
         if keys is None:
-            d = dict((k, json.loads(v)) for k,v in self.engine_config.iteritems())
+            d = dict((k, json.loads(v)) for k, v in self.engine_config.iteritems())
         else:
             d = dict((k, json.loads(self.engine_config[k]))
                 for k in keys if k in self.engine_config)
@@ -705,9 +767,30 @@ class LocalDomainStore(DomainStore):
 
         @param conf dictionary mapping strings to JSON-serializable objects
         """
-        for k,v in conf.iteritems():
+        for k, v in conf.iteritems():
             self.engine_config[k] = json.dumps(v)
         self.engine_config_version += 1
+
+    def get_domain_sensor_data(self):
+        """Retrieve a dictionary of sensor data from the store
+        """
+        return self.domain_sensor_data
+
+    def add_domain_sensor_data(self, sensor_data):
+        """Store a dictionary of domain sensor data.
+
+        This operation replaces previous sensor data
+
+        data is in the format:
+        {
+          'metric':{
+            'Average': 5
+          }
+        }
+
+        @param sensor_data dictionary mapping strings to JSON-serializable objects
+        """
+        self.domain_sensor_data = sensor_data
 
     def get_health_config(self, keys=None):
         """Retrieve the health config dictionary.
@@ -716,7 +799,7 @@ class LocalDomainStore(DomainStore):
         @retval config dictionary object
         """
         if keys is None:
-            d = dict((k, json.loads(v)) for k,v in self.health_config.iteritems())
+            d = dict((k, json.loads(v)) for k, v in self.health_config.iteritems())
         else:
             d = dict((k, json.loads(self.health_config[k]))
                 for k in keys if k in self.health_config)
@@ -731,7 +814,7 @@ class LocalDomainStore(DomainStore):
 
         @param conf dictionary mapping strings to JSON-serializable objects
         """
-        for k,v in conf.iteritems():
+        for k, v in conf.iteritems():
             self.health_config[k] = json.dumps(v)
 
     def get_general_config(self, keys=None):
@@ -741,7 +824,7 @@ class LocalDomainStore(DomainStore):
         @retval config dictionary object
         """
         if keys is None:
-            d = dict((k, json.loads(v)) for k,v in self.general_config.iteritems())
+            d = dict((k, json.loads(v)) for k, v in self.general_config.iteritems())
         else:
             d = dict((k, json.loads(self.general_config[k]))
                 for k in keys if k in self.general_config)
@@ -756,7 +839,7 @@ class LocalDomainStore(DomainStore):
 
         @param conf dictionary mapping strings to JSON-serializable objects
         """
-        for k,v in conf.iteritems():
+        for k, v in conf.iteritems():
             self.general_config[k] = json.dumps(v)
 
     def get_subscribers(self):
@@ -853,7 +936,8 @@ class LocalDomainStore(DomainStore):
         next invocation of this method.
         """
         s = self.engine_state
-        #TODO not yet dealing with sensors or change lists
+        # TODO not yet dealing with sensors or change lists
+        s.sensors = self.get_domain_sensor_data()
         s.instances = dict((i.instance_id, i) for i in self.get_instances())
         return s
 
@@ -884,7 +968,8 @@ class ZooKeeperEPUMStore(EPUMStore):
     DOMAINS_PATH = "/domains"
     DEFINITIONS_PATH = "/definitions"
 
-    def __init__(self, service_name, hosts, base_path, username=None, password=None, timeout=None, use_gevent=False, proc_name=None):
+    def __init__(self, service_name, hosts, base_path, username=None, password=None,
+                 timeout=None, use_gevent=False, proc_name=None):
         super(ZooKeeperEPUMStore, self).__init__()
 
         self.service_name = service_name
@@ -892,6 +977,8 @@ class ZooKeeperEPUMStore(EPUMStore):
         kwargs = zkutil.get_kazoo_kwargs(username=username, password=password,
             timeout=timeout, use_gevent=use_gevent)
         self.kazoo = KazooClient(hosts + base_path, **kwargs)
+
+        self.retry = zkutil.get_kazoo_retry()
 
         if not proc_name:
             proc_name = ""
@@ -927,10 +1014,17 @@ class ZooKeeperEPUMStore(EPUMStore):
         for path in (self.DOMAINS_PATH, self.DEFINITIONS_PATH):
             self.kazoo.ensure_path(path)
 
+    def shutdown(self):
+        self.kazoo.stop()
+        try:
+            self.kazoo.close()
+        except Exception:
+            log.exception("Problem cleaning up kazoo")
+
     def _connection_state_listener(self, state):
         # called by kazoo when the connection state changes.
         # handle in background
-        state_listener = tevent.spawn(self._handle_connection_state, state)
+        tevent.spawn(self._handle_connection_state, state)
 
     def _handle_connection_state(self, state):
 
@@ -941,17 +1035,17 @@ class ZooKeeperEPUMStore(EPUMStore):
 
             # depose the leaders and cancel the elections just in case
             try:
-                self._decider_leader.depose()
+                self._decider_leader.not_leader()
             except Exception, e:
                 log.exception("Error deposing decider leader: %s", e)
 
             try:
-                self._doctor_leader.depose()
+                self._doctor_leader.not_leader()
             except Exception, e:
                 log.exception("Error deposing doctor leader: %s", e)
 
             try:
-                self._reaper_leader.depose()
+                self._reaper_leader.not_leader()
             except Exception, e:
                 log.exception("Error deposing reaper leader: %s", e)
 
@@ -1031,7 +1125,7 @@ class ZooKeeperEPUMStore(EPUMStore):
             domain = self._domain_cache.get(key)
             if not domain:
                 path = self._get_domain_path(owner, domain_id)
-                domain = ZooKeeperDomainStore(owner, domain_id, self.kazoo, path)
+                domain = ZooKeeperDomainStore(owner, domain_id, self.kazoo, self.retry, path)
                 self._domain_cache[key] = domain
             return domain
 
@@ -1039,7 +1133,7 @@ class ZooKeeperEPUMStore(EPUMStore):
         validate_entity_name(definition_id)
 
         path = self._get_definition_path(definition_id)
-        definition = ZooKeeperDomainDefinitionStore(definition_id, self.kazoo, path)
+        definition = ZooKeeperDomainDefinitionStore(definition_id, self.kazoo, self.retry, path)
         return definition
 
     def _get_definition_path(self, definition_id):
@@ -1060,7 +1154,7 @@ class ZooKeeperEPUMStore(EPUMStore):
         data = json.dumps(config)
 
         try:
-            self.kazoo.create(path, data, makepath=True)
+            self.retry(self.kazoo.create, path, data, makepath=True)
         except NodeExistsException:
             raise WriteConflictError("domain %s already exists for owner %s" %
                                      (domain_id, owner))
@@ -1074,7 +1168,7 @@ class ZooKeeperEPUMStore(EPUMStore):
         for the domain.
         """
         path = self._get_domain_path(owner, domain_id)
-        self.kazoo.delete(path, recursive=True)
+        self.retry(self.kazoo.delete, path, recursive=True)
 
         with self._domain_cache_lock:
             if (owner, domain_id) in self._domain_cache:
@@ -1085,7 +1179,7 @@ class ZooKeeperEPUMStore(EPUMStore):
         """
         path = self._get_owner_path(owner)
         try:
-            return self.kazoo.get_children(path)
+            return self.retry(self.kazoo.get_children, path)
         except NoNodeException:
             # if the owner ZNode doesn't exist, that user isn't necessarily
             # invalid as those buckets are lazily-created. Return the empty
@@ -1095,14 +1189,14 @@ class ZooKeeperEPUMStore(EPUMStore):
     def list_domains(self):
         """Retrieve a list of (owner, domain) pairs
         """
-        #parallelize this?
+        # parallelize this?
 
-        owners = self.kazoo.get_children(self.DOMAINS_PATH)
+        owners = self.retry(self.kazoo.get_children, self.DOMAINS_PATH)
 
         found = []
         for owner in owners:
             try:
-                domains = self.kazoo.get_children(self._get_owner_path(owner))
+                domains = self.retry(self.kazoo.get_children, self._get_owner_path(owner))
                 found.extend((owner, domain_id) for domain_id in domains)
 
             except NoNodeException:
@@ -1117,7 +1211,7 @@ class ZooKeeperEPUMStore(EPUMStore):
         @rtype DomainStore
         """
 
-        stat = self.kazoo.exists(self._get_domain_path(owner, domain_id))
+        stat = self.retry(self.kazoo.exists, self._get_domain_path(owner, domain_id))
 
         if stat:
             return self._get_domain_store(owner, domain_id)
@@ -1140,7 +1234,7 @@ class ZooKeeperEPUMStore(EPUMStore):
 
         validate_entity_name(instance_id)
 
-        #TODO speed this up with a lookup table from instance ID to domainid/owner
+        # TODO speed this up with a lookup table from instance ID to domainid/owner
         # at the same time, we can centralize the ID generating and even switch to
         # more legible IDs. DI-XXXXXXX and DL-XXXXXXX (Domain Instance and Domain
         # Launch)
@@ -1163,7 +1257,7 @@ class ZooKeeperEPUMStore(EPUMStore):
         data = json.dumps(definition)
 
         try:
-            self.kazoo.create(path, data, makepath=True)
+            self.retry(self.kazoo.create, path, data, makepath=True)
         except NodeExistsException:
             raise WriteConflictError("domain definition %s already exists" %
                                      definition_id)
@@ -1173,7 +1267,7 @@ class ZooKeeperEPUMStore(EPUMStore):
     def list_domain_definitions(self):
         """Retrieve a list of domain definitions ids
         """
-        definitions = self.kazoo.get_children(self.DEFINITIONS_PATH)
+        definitions = self.retry(self.kazoo.get_children, self.DEFINITIONS_PATH)
         return definitions
 
     def get_domain_definition(self, definition_id):
@@ -1184,7 +1278,7 @@ class ZooKeeperEPUMStore(EPUMStore):
         @rtype DomainDefinitionStore
         """
 
-        stat = self.kazoo.exists(self._get_definition_path(definition_id))
+        stat = self.retry(self.kazoo.exists, self._get_definition_path(definition_id))
 
         if stat:
             return self._get_definition_store(definition_id)
@@ -1195,7 +1289,7 @@ class ZooKeeperEPUMStore(EPUMStore):
         """Remove a domain definition
         """
         path = self._get_definition_path(definition_id)
-        self.kazoo.delete(path)
+        self.retry(self.kazoo.delete, path)
 
     def update_domain_definition(self, definition_id, definition):
         """Update a domain definition
@@ -1204,7 +1298,7 @@ class ZooKeeperEPUMStore(EPUMStore):
         data = json.dumps(definition)
 
         try:
-            self.kazoo.set(path, data, -1)
+            self.retry(self.kazoo.set, path, data, -1)
         except BadVersionException:
             raise WriteConflictError()
         except NoNodeException:
@@ -1217,34 +1311,37 @@ class ZooKeeperDomainStore(DomainStore):
     SUBSCRIBERS_PATH = "subscribers"
     INSTANCES_PATH = "instances"
     INSTANCE_HEARTBEAT_PATH = "heartbeat"
+    DOMAIN_SENSOR_PATH = "domainsensor"
 
-    def __init__(self, owner, domain_id, kazoo, path):
+    def __init__(self, owner, domain_id, kazoo, retry, path):
         super(ZooKeeperDomainStore, self).__init__(owner, domain_id)
 
         self.kazoo = kazoo
+        self.retry = retry
         self.path = path
 
         self.removed_path = self.path + "/" + self.REMOVED_PATH
         self.subscribers_path = self.path + "/" + self.SUBSCRIBERS_PATH
         self.instances_path = self.path + "/" + self.INSTANCES_PATH
+        self.domain_sensor_path = self.path + "/" + self.DOMAIN_SENSOR_PATH
 
         self.engine_state = EngineState()
 
     def is_removed(self):
         """Whether this domain has been marked for removal
         """
-        return bool(self.kazoo.exists(self.removed_path))
+        return bool(self.retry(self.kazoo.exists, self.removed_path))
 
     def remove(self):
         """Mark this instance for removal
         """
         try:
-            self.kazoo.create(self.removed_path, "")
+            self.retry(self.kazoo.create, self.removed_path, "")
         except NodeExistsException:
             pass
 
     def _get_config_and_version(self, section, keys=None):
-        domain_config, stat = self.kazoo.get(self.path)
+        domain_config, stat = self.retry(self.kazoo.get, self.path)
 
         domain_config = json.loads(domain_config)
         version = stat.version
@@ -1263,7 +1360,7 @@ class ZooKeeperDomainStore(DomainStore):
 
         updated = False
         while not updated:
-            domain_config, stat = self.kazoo.get(self.path)
+            domain_config, stat = self.retry(self.kazoo.get, self.path)
             domain_config = json.loads(domain_config)
             section_conf = domain_config.get(section)
             if section_conf is None:
@@ -1273,7 +1370,7 @@ class ZooKeeperDomainStore(DomainStore):
 
             data = json.dumps(domain_config)
             try:
-                self.kazoo.set(self.path, data, stat.version)
+                self.retry(self.kazoo.set, self.path, data, stat.version)
                 updated = True
             except BadVersionException:
                 pass
@@ -1305,6 +1402,58 @@ class ZooKeeperDomainStore(DomainStore):
         @param conf dictionary mapping strings to JSON-serializable objects
         """
         self._add_config(EPUM_CONF_ENGINE, conf)
+
+    def get_domain_sensor_data(self):
+        """Retrieve a dictionary of sensor data from the store
+        """
+        path = self.domain_sensor_path
+        try:
+            sensor_data = self.retry(self.kazoo.get, path)
+        except NoNodeException:
+            sensor_data = {}
+        return sensor_data
+
+    def add_domain_sensor_data(self, sensor_data):
+        """Store a dictionary of domain sensor data.
+
+        This operation replaces previous sensor data
+
+        data is in the format:
+        {
+          'metric':{
+            'Average': 5
+          }
+        }
+
+        @param sensor_data dictionary mapping strings to JSON-serializable objects
+
+        """
+
+        try:
+            sensor_json = json.dumps(sensor_data)
+        except Exception:
+            log.exception("Could not convert sensor data to JSON")
+            return
+
+        path = self.domain_sensor_path
+        version = -1
+
+        try:
+            self.retry(self.kazoo.get, path)
+        except NoNodeException:
+            try:
+                self.retry(self.kazoo.create, path, sensor_json, makepath=True)
+            except BadVersionException:
+                raise WriteConflictError()
+            except NoNodeException:
+                raise NotFoundError()
+        else:
+            try:
+                self.retry(self.kazoo.set, path, sensor_json, version)
+            except BadVersionException:
+                raise WriteConflictError()
+            except NoNodeException:
+                raise NotFoundError()
 
     def get_health_config(self, keys=None):
         """Retrieve the health config dictionary.
@@ -1350,7 +1499,7 @@ class ZooKeeperDomainStore(DomainStore):
         """Retrieve a list of current subscribers
         """
         try:
-            subscribers_json, _ = self.kazoo.get(self.subscribers_path)
+            subscribers_json, _ = self.retry(self.kazoo.get, self.subscribers_path)
         except NoNodeException:
             return []
 
@@ -1364,7 +1513,7 @@ class ZooKeeperDomainStore(DomainStore):
         # explicit returns seems the cleanest for this one
         while True:
             try:
-                subscribers_json, stat = self.kazoo.get(self.subscribers_path)
+                subscribers_json, stat = self.retry(self.kazoo.get, self.subscribers_path)
             except NoNodeException:
 
                 # there are no subscribers so far. create the ZNode, while
@@ -1374,7 +1523,7 @@ class ZooKeeperDomainStore(DomainStore):
                 subscribers_json = json.dumps(subscribers)
 
                 try:
-                    self.kazoo.create(self.subscribers_path, subscribers_json)
+                    self.retry(self.kazoo.create, self.subscribers_path, subscribers_json)
 
                     # **** EXPLICIT RETURN ****
                     return
@@ -1397,7 +1546,7 @@ class ZooKeeperDomainStore(DomainStore):
 
             subscribers_json = json.dumps(subscribers)
             try:
-                self.kazoo.set(self.subscribers_path, subscribers_json,
+                self.retry(self.kazoo.set, self.subscribers_path, subscribers_json,
                     stat.version)
                 # **** EXPLICIT RETURN ****
                 return
@@ -1414,7 +1563,7 @@ class ZooKeeperDomainStore(DomainStore):
         """
         while True:
             try:
-                subscribers_json, stat = self.kazoo.get(self.subscribers_path)
+                subscribers_json, stat = self.retry(self.kazoo.get, self.subscribers_path)
             except NoNodeException:
                 # **** EXPLICIT RETURN ****
                 return
@@ -1429,7 +1578,7 @@ class ZooKeeperDomainStore(DomainStore):
 
             subscribers_json = json.dumps(subscribers)
             try:
-                self.kazoo.set(self.subscribers_path, subscribers_json,
+                self.retry(self.kazoo.set, self.subscribers_path, subscribers_json,
                     stat.version)
 
                 # **** EXPLICIT RETURN ****
@@ -1461,7 +1610,7 @@ class ZooKeeperDomainStore(DomainStore):
         path = self._get_instance_path(instance_id)
 
         try:
-            self.kazoo.create(path, instance_json, makepath=True)
+            self.retry(self.kazoo.create, path, instance_json, makepath=True)
             instance.set_version(0)
         except NodeExistsException:
             raise WriteConflictError()
@@ -1492,7 +1641,7 @@ class ZooKeeperDomainStore(DomainStore):
         path = self._get_instance_path(instance_id)
 
         try:
-            self.kazoo.set(path, instance_json, version)
+            self.retry(self.kazoo.set, path, instance_json, version)
         except BadVersionException:
             raise WriteConflictError()
         except NoNodeException:
@@ -1505,7 +1654,7 @@ class ZooKeeperDomainStore(DomainStore):
         """
         path = self._get_instance_path(instance_id)
         try:
-            instance_json, stat = self.kazoo.get(path)
+            instance_json, stat = self.retry(self.kazoo.get, path)
         except NoNodeException:
             return None
 
@@ -1522,14 +1671,13 @@ class ZooKeeperDomainStore(DomainStore):
         Raise a NotFoundError if the instance is unknown
         """
 
-
         path = self._get_instance_path(instance_id)
         try:
-            instance_json, stat = self.kazoo.get(path)
+            instance_json, stat = self.retry(self.kazoo.get, path)
         except NoNodeException:
             raise NotFoundError()
 
-        self.kazoo.delete(path)
+        self.retry(self.kazoo.delete, path)
 
     def set_instance_heartbeat_time(self, instance_id, time):
         """Store a new instance heartbeat
@@ -1538,13 +1686,13 @@ class ZooKeeperDomainStore(DomainStore):
             path = self._get_instance_heartbeat_path(instance_id)
             time_json = json.dumps(time)
             try:
-                beat_time_json, stat = self.kazoo.get(path)
+                beat_time_json, stat = self.retry(self.kazoo.get, path)
             except NoNodeException:
 
                 # there is no heartbeat node yet
 
                 try:
-                    self.kazoo.create(path, time_json)
+                    self.retry(self.kazoo.create, path, time_json)
 
                     # **** EXPLICIT RETURN ****
                     return
@@ -1561,7 +1709,7 @@ class ZooKeeperDomainStore(DomainStore):
             # only update if the last beat time is older
             if beat_time < time:
                 try:
-                    self.kazoo.set(path, time_json, stat.version)
+                    self.retry(self.kazoo.set, path, time_json, stat.version)
 
                     # **** EXPLICIT RETURN ****
                     return
@@ -1580,7 +1728,7 @@ class ZooKeeperDomainStore(DomainStore):
         """
         path = self._get_instance_heartbeat_path(instance_id)
         try:
-            beat_time_json = self.kazoo.get(path)
+            beat_time_json = self.retry(self.kazoo.get, path)
         except NoNodeException:
             return None
 
@@ -1600,7 +1748,7 @@ class ZooKeeperDomainStore(DomainStore):
         """Retrieve a list of known instance IDs
         """
         try:
-            return self.kazoo.get_children(self.instances_path)
+            return self.retry(self.kazoo.get_children, self.instances_path)
         except NoNodeException:
             return []
 
@@ -1611,20 +1759,21 @@ class ZooKeeperDomainStore(DomainStore):
         next invocation of this method.
         """
         s = self.engine_state
-        #TODO not yet dealing with sensors or change lists
+        # TODO not yet dealing with sensors or change lists
         s.instances = dict((i.instance_id, i) for i in self.get_instances())
         return s
 
 
 class ZooKeeperDomainDefinitionStore(DomainDefinitionStore):
 
-    def __init__(self, definition_id, kazoo, path):
+    def __init__(self, definition_id, kazoo, retry, path):
         super(ZooKeeperDomainDefinitionStore, self).__init__(definition_id)
 
         self.kazoo = kazoo
+        self.retry = retry
         self.path = path
 
-        definition, stat = self.kazoo.get(self.path)
+        definition, stat = self.retry(self.kazoo.get, self.path)
         definition = json.loads(definition)
         self.definition = definition
 
@@ -1633,9 +1782,11 @@ class ZooKeeperDomainDefinitionStore(DomainDefinitionStore):
 
 
 _INVALID_NAMES = ("..", ".", "zookeeper")
+
+
 def validate_entity_name(name):
     """validation for owner and domain_id strings
     """
     if (not name or re.match('[^a-zA-Z0-9_\-.@]', name)
-        or name in _INVALID_NAMES):
+            or name in _INVALID_NAMES):
         raise ValueError("invalid name: %s" % name)

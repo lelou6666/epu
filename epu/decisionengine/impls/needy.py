@@ -26,6 +26,7 @@ CONF_UNIQUE_VALUES = "unique_values"
 
 BAD_STATES = [InstanceState.TERMINATING, InstanceState.TERMINATED, InstanceState.FAILED]
 
+
 class NeedyEngine(Engine):
     """
     A decision engine that takes DT-based sensor requests into account (DT: deployable type).
@@ -89,18 +90,18 @@ class NeedyEngine(Engine):
     def _set_conf(self, newconf):
         if not newconf:
             raise ValueError("requires engine conf")
-        if newconf.has_key(CONF_PRESERVE_N):
+        if CONF_PRESERVE_N in newconf:
             new_n = int(newconf[CONF_PRESERVE_N])
             if new_n < 0:
                 raise ValueError("cannot have negative %s conf: %d" % (CONF_PRESERVE_N, new_n))
             self.preserve_n = new_n
-        if newconf.has_key(CONF_IAAS_SITE):
+        if CONF_IAAS_SITE in newconf:
             self.iaas_site = newconf[CONF_IAAS_SITE]
-        if newconf.has_key(CONF_IAAS_ALLOCATION):
+        if CONF_IAAS_ALLOCATION in newconf:
             self.iaas_allocation = newconf[CONF_IAAS_ALLOCATION]
-        if newconf.has_key(CONF_DEPLOYABLE_TYPE):
+        if CONF_DEPLOYABLE_TYPE in newconf:
             self.deployable_type = newconf[CONF_DEPLOYABLE_TYPE]
-        if newconf.has_key(CONF_RETIRABLE_NODES):
+        if CONF_RETIRABLE_NODES in newconf:
             self.retirable_nodes = newconf[CONF_RETIRABLE_NODES]
         if newconf.get(CONF_UNIQUE_KEY) and newconf.get(CONF_UNIQUE_VALUES):
             key = newconf[CONF_UNIQUE_KEY]
@@ -161,7 +162,7 @@ class NeedyEngine(Engine):
         all_instances = state.instances.values()
         valid_set = set(i.instance_id for i in all_instances if not i.state in BAD_STATES)
 
-        #check all nodes to see if some are unhealthy, and terminate them
+        # check all nodes to see if some are unhealthy, and terminate them
         for instance in state.get_unhealthy_instances():
             log.warn("Terminating unhealthy node: %s", instance.instance_id)
             self._destroy_one(control, instance.instance_id)
@@ -196,9 +197,13 @@ class NeedyEngine(Engine):
                 extravars = {self.unique_key: None}
 
             while valid_count < self.preserve_n:
-                # if we run out of uniques, we start using None
+                # if we run out of uniques, complain
                 if self.unique_key:
-                    extravars[self.unique_key] = next(next_uniques, None)
+                    try:
+                        extravars[self.unique_key] = next(next_uniques)
+                    except StopIteration:
+                        log.error("Ran out of unique '%s' values. Can't start more VMs" % self.unique_key)
+                        break
 
                 self._launch_one(control, extravars=extravars)
                 valid_count += 1
@@ -213,7 +218,7 @@ class NeedyEngine(Engine):
                         die_id = instance_id
                         break
                 if not die_id:
-                    die_id = random.sample(valid_set, 1)[0] # len(valid_set) is always > 0 here
+                    die_id = random.sample(valid_set, 1)[0]  # len(valid_set) is always > 0 here
                 self._destroy_one(control, die_id)
                 valid_set.discard(die_id)
                 valid_count -= 1
@@ -228,8 +233,6 @@ class NeedyEngine(Engine):
     def _launch_one(self, control, extravars=None):
         if not self.iaas_site:
             raise Exception("No IaaS site configuration")
-        if not self.iaas_allocation:
-            raise Exception("No IaaS allocation configuration")
         if not self.deployable_type:
             raise Exception("No deployable type configuration")
         launch_id, instance_ids = control.launch(self.deployable_type,

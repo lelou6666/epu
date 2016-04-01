@@ -1,5 +1,6 @@
+# Copyright 2013 University of Chicago
+
 import os
-import md5
 import urllib2
 
 from StringIO import StringIO
@@ -11,6 +12,7 @@ from epu.sensors import Statistics
 from epu.sensors.trafficsentinel import TrafficSentinel, _extract_app_attribute
 from pprint import PrettyPrinter
 pprint = PrettyPrinter(indent=2).pprint
+
 
 class TestTrafficSentinel(object):
 
@@ -38,7 +40,7 @@ class TestTrafficSentinel(object):
         # since a real TS will always have its own values
         test_host = os.environ.get("TRAFFIC_SENTINEL_HOST", "fake.ts.host.tld")
         loads = [0.010, 0.020]
-        test_reply =  "%s,%f\n" % (test_host, loads[0])
+        test_reply = "%s,%f\n" % (test_host, loads[0])
         test_reply += "%s,%f\n" % (test_host, loads[1])
         load_average = sum(loads) / float(len(loads))
         if self.mock_traffic_sentinel:
@@ -65,7 +67,7 @@ class TestTrafficSentinel(object):
 
     def test_get_metric_statistics_app_attributes(self):
 
-        test_host = os.environ.get("TRAFFIC_SENTINEL_HOST", "fake.ts.host.tld")
+        # test_host = os.environ.get("TRAFFIC_SENTINEL_HOST", "fake.ts.host.tld")
         test_process = os.environ.get("TRAFFIC_SENTINEL_PROCESS", "fake.process")
         queue_length = 1
         ml = 1
@@ -99,11 +101,11 @@ class TestTrafficSentinel(object):
         query_type = 'host'
         group = 60
         interval = "201209190101.01-201209200101.01"
-        dimensions = {'hostname' : ['somevm.cloud.tld', 'someothervm.cloud.tld']}
+        dimensions = {'hostname': ['somevm.cloud.tld', 'someothervm.cloud.tld']}
         script = self.traffic_sentinel._build_script(query_fields, query_type, interval, group, dimensions)
         assert 'interval = "%s"' % interval in script
         assert 'select = "%s"' % ','.join(query_fields) in script
-        assert 'where = "%s"' % '(hostname = somevm.cloud.tld | someothervm.cloud.tld)' in script
+        assert 'where = "%s"' % '(hostname = somevm.cloud.tld | hostname = someothervm.cloud.tld)' in script
 
 
 class TestRealTrafficSentinel(TestTrafficSentinel):
@@ -124,6 +126,7 @@ class TestRealTrafficSentinel(TestTrafficSentinel):
     def teardown(self):
         pass
 
+
 def test_extract_app_attribute():
     key = "ql"
     app_attribute_empty = ""
@@ -140,4 +143,3 @@ def test_extract_app_attribute():
 
     got = _extract_app_attribute(app_attribute_two, key)
     assert got == app_attribute_two_value
-

@@ -1,9 +1,12 @@
+# Copyright 2013 University of Chicago
 
-import urllib
 import httplib
-import datetime
+import logging
+import urllib
 
 from epu.sensors import ISensorAggregator, Statistics
+
+log = logging.getLogger(__name__)
 
 _stat_map = {
     Statistics.AVERAGE: 'avg',
@@ -11,6 +14,7 @@ _stat_map = {
     Statistics.MINIMUM: 'min',
     Statistics.SUM: 'sum',
 }
+
 
 class OpenTSDB(ISensorAggregator):
     """Implementation of OpenTSDB sensor aggregator client
@@ -20,7 +24,8 @@ class OpenTSDB(ISensorAggregator):
         self.host = host
         self.port = port
 
-        self.opentsdb = httplib.HTTPConnection(self.host, self.port)
+    def get_opentsdb_connection(self):
+        return httplib.HTTPConnection(self.host, self.port)
 
     def get_metric_statistics(self, period, start_time, end_time, metric_name,
             statistics, dimensions=None):
@@ -58,20 +63,35 @@ class OpenTSDB(ISensorAggregator):
             'm': "%s:%s%s" % (_stat_map.get(statistics, 'avg'), metric_name, formatted_dimensions),
             'ascii': 'true'
         })
-        self.opentsdb.request('GET', '/q?%s' % params)
-        response = self.opentsdb.getresponse()
+        opentsdb = self.get_opentsdb_connection()
+        try:
+            opentsdb.request('GET', '/q?%s' % params)
+        except:
+            log.exception("Failed to query OpenTSDB")
+            return {}
+        response = opentsdb.getresponse()
 
         if response.status != 200:
+            log.warn("OpenTSDB query returned status %d", response.status)
             return {}
 
-        index = 'host' #TODO: this could be process etc in future
+        # TODO: this could be process etc in future
+        if 'domain' in dimensions:
+            index = 'domain'
+        elif 'phantom_unique' in dimensions:
+            index = 'phantom_unique'
+        else:
+            index = 'host'
 
         parsed_stats = {}
-        raw_stats =  response.read()
+        raw_stats = response.read()
+        opentsdb.close()
 
         for line in raw_stats.splitlines():
             metric_name, timestamp, raw_data, raw_params = line.split(' ', 3)
-            host = None
+
+            if timestamp > end_time.strftime("%s") or timestamp < start_time.strftime("%s"):
+                continue
             params = {}
             for pair in raw_params.split(' '):
                 key, val = pair.split('=')
@@ -95,7 +115,7 @@ class OpenTSDB(ISensorAggregator):
                 except ZeroDivisionError:
                     m[Statistics.AVERAGE] = 0.0
             if Statistics.SUM in statistics:
-                m[Statistics.SUM] = sum(map(float,series))
+                m[Statistics.SUM] = sum(map(float, series))
             if Statistics.SAMPLE_COUNT in statistics:
                 m[Statistics.SAMPLE_COUNT] = len(series)
             if Statistics.MAXIMUM in statistics:
@@ -104,6 +124,7 @@ class OpenTSDB(ISensorAggregator):
                 m[Statistics.MINIMUM] = min(map(float, series))
 
         return parsed_stats
+
 
 def parse_data(raw_data):
     """Try to get a numerical form of string data.
@@ -118,6 +139,7 @@ def parse_data(raw_data):
         except ValueError:
             data = str(raw_data)
     return data
+
 
 def format_dimensions(raw_dimensions):
 

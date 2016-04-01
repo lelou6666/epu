@@ -1,0 +1,16 @@
+amqp==1.0.10
+anyjson==0.3.3
+-e git+https://github.com/nimbusproject/libcloud.git@phantom#egg=apache-libcloud
+boto==2.8.0
+dashi==0.3.0
+gevent==0.13.8
+greenlet==0.4.0
+httplib2==0.8
+kazoo==1.2.1
+kombu==2.5.8
+mock==1.0.1
+PyYAML==3.10
+pychef==0.2.1
+simplejson==3.1.2
+statsd==2.0.0
+zope.interface==4.0.5

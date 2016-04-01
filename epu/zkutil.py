@@ -1,4 +1,18 @@
+# Copyright 2013 University of Chicago
+
 from kazoo.security import make_digest_acl
+from kazoo.retry import KazooRetry
+
+MAX_NODE_SIZE = 1048576
+
+
+def check_data(data):
+    """Check if data is bigger than the maximum node size supported by zookeeper.
+
+    If it is, throw a ValueError
+    """
+    if len(data) > MAX_NODE_SIZE:
+        raise ValueError("Data is too long (%s Bytes) for zookeeper" % len(data))
 
 
 def is_zookeeper_enabled(config):
@@ -42,10 +56,11 @@ def get_auth_data_and_acl(username, password):
     return auth_data, default_acl
 
 
-def get_kazoo_kwargs(username=None, password=None, timeout=None, use_gevent=False):
+def get_kazoo_kwargs(username=None, password=None, timeout=None, use_gevent=False,
+        retry_backoff=1.1):
     """Get KazooClient optional keyword arguments as a dictionary
     """
-    kwargs = {}
+    kwargs = {"retry_backoff": retry_backoff}
 
     if use_gevent:
         from kazoo.handlers.gevent import SequentialGeventHandler
@@ -61,3 +76,10 @@ def get_kazoo_kwargs(username=None, password=None, timeout=None, use_gevent=Fals
         kwargs['timeout'] = timeout
 
     return kwargs
+
+
+def get_kazoo_retry(**kwargs):
+    # start with some defaults
+    retry_kwargs = dict(max_tries=-1, backoff=1.2)
+    retry_kwargs.update(kwargs)
+    return KazooRetry(**retry_kwargs)
